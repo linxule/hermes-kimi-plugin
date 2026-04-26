@@ -1,0 +1,79 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "hermes-kimi-plugin"
+version = "1.0.0"
+description = "Kimi (kimi.com / Moonshot AI) chat platform adapter for Hermes Agent — DM + group rooms under one bot identity"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [
+    { name = "Xule Lin", email = "x@linxule.com" },
+]
+keywords = ["hermes", "hermes-agent", "kimi", "moonshot", "chat", "platform-adapter", "plugin"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Communications :: Chat",
+]
+
+# This pyproject.toml exists for tooling metadata (testing, dependency
+# declaration, project URLs) only — there's no build-system section because
+# this plugin is NOT pip-installable. See the wheel-target NOTE below.
+dependencies = [
+    # The plugin uses Hermes Agent APIs (gateway.config, gateway.platforms.base,
+    # gateway.platforms.registry) AND requires Platform.KIMI in the closed enum.
+    # Until both land upstream, install from a branch that carries both:
+    #   pip install 'hermes-agent @ git+https://github.com/linxule/hermes-agent.git@feat/kimi-plugin-variant'
+    # See README "Install" section for the full procedure.
+    "hermes-agent>=0.11.0",
+    "websockets>=12.0",
+    "aiohttp>=3.9.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.21",
+    "pyyaml>=6.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/linxule/hermes-kimi-plugin"
+Repository = "https://github.com/linxule/hermes-kimi-plugin"
+Issues = "https://github.com/linxule/hermes-kimi-plugin/issues"
+"Hermes Agent" = "https://github.com/NousResearch/hermes-agent"
+
+# Metadata-only wheel: no source files shipped. The plugin install model is
+# "drop the repo into $HERMES_HOME/plugins/kimi/". `pip install -e '.[dev]'`
+# from the repo root works for installing test deps locally — the resulting
+# wheel is intentionally empty. A flat-wheel target with __init__.py +
+# kimi_adapter.py would install them directly into site-packages/ and clash
+# with anything else using flat-wheel layout, AND the Hermes plugin loader
+# doesn't discover from site-packages, so the install would silently break
+# things while looking like it succeeded. Pip-installable distribution is
+# deferred until upstream documents a site-packages plugin-discovery path.
+[tool.hatch.build.targets.wheel]
+# Empty packages list → hatchling builds a metadata-only wheel (no source files
+# shipped). `pip install -e '.[dev]'` still resolves and installs deps. The
+# plugin code is intentionally not in the wheel because (a) it doesn't belong
+# in site-packages, (b) flat-wheel layout would clash with other packages.
+packages = []
+only-include = []
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+# importlib import-mode keeps pytest from walking parent directories looking
+# for ``__init__.py`` files to build a package tree. That walk would otherwise
+# pick up the repo-root ``__init__.py`` (which is for the Hermes plugin loader,
+# not pytest) and fail on the relative imports inside register().
+addopts = "--import-mode=importlib"

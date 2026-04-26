@@ -1,0 +1,7 @@
+name: kimi
+version: 1.0.0
+description: "Kimi (kimi.com / Moonshot AI) chat platform adapter — DM (Zed ACP over WebSocket) + group rooms (Connect RPC over WebSocket) under one bot identity. Registers a BasePlatformAdapter via the platform-adapter registry hook."
+author: linxule
+kind: standalone
+requires_env:
+  - KIMI_BOT_TOKEN
