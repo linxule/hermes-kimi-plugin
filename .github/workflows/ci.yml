@@ -18,7 +18,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.10", "3.11", "3.12"]
+        # 3.10 is intentionally excluded: hermes-agent declares
+        # `requires-python = ">=3.11"` in its pyproject, so a 3.10 leg fails
+        # at the install step with "Package 'hermes-agent' requires a
+        # different Python: 3.10.x not in '>=3.11'". Mirror that floor here.
+        python-version: ["3.11", "3.12"]
 
     steps:
       - uses: actions/checkout@v4
