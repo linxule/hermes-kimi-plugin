@@ -20,6 +20,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 from gateway.config import GatewayConfig, HomeChannel, Platform, PlatformConfig
 from gateway.platforms.base import MessageType, SendResult
 from kimi_adapter import (
+    _ARRIVAL_TIME_CACHE_DEFAULT_MAX,
     _CONNECT_FLAG_COMPRESSED,
     _CONNECT_FLAG_END_STREAM,
     _DMInflight,
@@ -1987,12 +1988,23 @@ class SubscribeBackoffStateTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(recovered, [])
 
     async def test_subscribe_backoff_not_reset_on_handler_exception(self):
-        """If _on_group_event raises on the first chatMessage, the state
-        flip and recovery log must NOT fire — otherwise a dispatch-error
-        loop would masquerade as a healthy stream.
+        """If _on_group_event raises on the first chatMessage, the
+        operator-facing recovery log must NOT fire — otherwise a
+        dispatch-error loop would masquerade as a healthy stream.
+        Backoff is untouched too.
 
-        The exception should still propagate as before (caught by the
-        outer handlers into return code 0 / transient retry).
+        Cumulative review #58 split the pre-dispatch state transitions
+        from the post-dispatch operator log: counter + ts + gate flip
+        happen synchronously with first-frame detection (so the gap
+        log inside dispatch reads consistent ``connect#`` values), but
+        the recovery LOG and backoff CLAMP still gate on processing
+        success. This test exercises that split — pre-dispatch state
+        moves forward; operator-visible "healthy stream" signals do
+        NOT fire on dispatch failure.
+
+        The exception still propagates as before (caught by the outer
+        handlers into return code 0 / transient retry; the next cycle
+        resets the gate at the top of ``_group_subscribe_once``).
         """
         adapter = KimiAdapter(_cfg())
         self._install_fake_session(adapter)
@@ -2013,9 +2025,20 @@ class SubscribeBackoffStateTests(unittest.IsolatedAsyncioTestCase):
         # Transient handler errors are swallowed to rc=0 (retry) by the
         # outer except block, so the caller retries the reconnect.
         self.assertEqual(rc, 0)
-        # Exception pre-empted the state flip — backoff untouched.
+        # Backoff: untouched (the clamp is post-dispatch, gated on success).
         self.assertEqual(adapter._group_subscribe_backoff, 32.0)
-        self.assertFalse(adapter._group_subscribe_frame_since_connect)
+        # Pre-dispatch state IS now advanced (#58): the counter increments
+        # and the gate flips before _on_group_event runs. Their meaning is
+        # "WS layer delivered a real chatMessage this cycle", which is
+        # true regardless of processing outcome. Cycle-level reset on the
+        # next reconnect (line 2500) clears the gate cleanly.
+        self.assertTrue(adapter._group_subscribe_frame_since_connect)
+        self.assertEqual(adapter._group_subscribe_reconnect_count, 1)
+        # The actual operator-visible "healthy stream" signals must
+        # remain silent on dispatch failure — both the new "subscribe
+        # stream live" and the legacy "stream recovered" log lines.
+        live = [r for r in records if "subscribe stream live" in r.getMessage()]
+        self.assertEqual(live, [], "stream-live log must not fire on dispatch failure")
         recovered = [r for r in records if "stream recovered" in r.getMessage()]
         self.assertEqual(recovered, [])
 
@@ -3052,11 +3075,17 @@ def _compute_session_key(adapter: "KimiAdapter", event: "MagicMock") -> str:
 class BurstDropGapLogTests(unittest.IsolatedAsyncioTestCase):
     """Phase 0 (#18): suspicious wall-clock gaps logged at INFO.
 
-    Tests use ``time.time`` patching to simulate per-room arrival deltas
-    deterministically — the gap-detection is fundamentally about wall-clock
-    receive intervals, so we drive that signal directly rather than via
-    message-id encoding (which is UUID v8 in production with a non-standard
-    epoch — see ``test_ulid_time_ms_returns_none_for_uuid_v8_production_format``).
+    Tests use ``time.monotonic`` patching to simulate per-room arrival
+    deltas deterministically. Cumulative review #58 switched gap-delta
+    tracking from ``time.time`` to ``time.monotonic`` (independent flags
+    from Codex and Kimi reviewers — wall-clock is unsafe for delta
+    computation under NTP step / leap-second / VM suspend-resume). Gap
+    detection is fundamentally about elapsed time between receives, which
+    monotonic answers directly without depending on wall-clock stability.
+
+    The message-ids in fixtures are UUID v8 to match Kimi's actual
+    production format — see ``test_ulid_time_ms_returns_none_for_uuid_v8_
+    production_format`` for the regression guard around id-derived timing.
     """
 
     def _adapter(self, **cfg):
@@ -3088,7 +3117,7 @@ class BurstDropGapLogTests(unittest.IsolatedAsyncioTestCase):
         # ``time.time`` is called multiple times per _on_group_event (gap
         # tracking + base-class hooks), so use return_value + manual swap
         # rather than a fixed-length side_effect.
-        with patch("kimi_adapter.time.time") as mock_time:
+        with patch("kimi_adapter.time.monotonic") as mock_time:
             mock_time.return_value = 1000.0
             try:
                 await adapter._on_group_event(
@@ -3109,7 +3138,7 @@ class BurstDropGapLogTests(unittest.IsolatedAsyncioTestCase):
         the gap signal is wall-clock-driven so id format is irrelevant."""
         adapter = self._adapter(burst_drop_gap_log_threshold_s=10.0)
         records, teardown = _capture_kimi_log_records(level=logging.INFO)
-        with patch("kimi_adapter.time.time") as mock_time:
+        with patch("kimi_adapter.time.monotonic") as mock_time:
             mock_time.return_value = 2000.0
             try:
                 await adapter._on_group_event(
@@ -3140,7 +3169,7 @@ class BurstDropGapLogTests(unittest.IsolatedAsyncioTestCase):
         adapter._group_subscribe_reconnect_count = 5
         adapter._group_subscribe_last_reconnect_ts = 3000.0
         records, teardown = _capture_kimi_log_records(level=logging.INFO)
-        with patch("kimi_adapter.time.time") as mock_time:
+        with patch("kimi_adapter.time.monotonic") as mock_time:
             mock_time.return_value = 3050.0
             try:
                 await adapter._on_group_event(
@@ -3162,7 +3191,7 @@ class BurstDropGapLogTests(unittest.IsolatedAsyncioTestCase):
         """First message has no prior arrival anchor; can't compute delta — no log."""
         adapter = self._adapter(burst_drop_gap_log_threshold_s=0.001)
         records, teardown = _capture_kimi_log_records(level=logging.INFO)
-        with patch("kimi_adapter.time.time", return_value=4000.0):
+        with patch("kimi_adapter.time.monotonic", return_value=4000.0):
             try:
                 await adapter._on_group_event(
                     self._msg("room-W", "19dc9c4f-1262-8c1b-8000-0a4a6c626bbb")
@@ -3176,7 +3205,7 @@ class BurstDropGapLogTests(unittest.IsolatedAsyncioTestCase):
         """Threshold 0 disables the INFO log entirely."""
         adapter = self._adapter(burst_drop_gap_log_threshold_s=0)
         records, teardown = _capture_kimi_log_records(level=logging.INFO)
-        with patch("kimi_adapter.time.time") as mock_time:
+        with patch("kimi_adapter.time.monotonic") as mock_time:
             mock_time.return_value = 5000.0
             try:
                 await adapter._on_group_event(
@@ -3201,13 +3230,65 @@ class BurstDropGapLogTests(unittest.IsolatedAsyncioTestCase):
         adapter = self._adapter(burst_drop_gap_log_threshold_s=-5.0)
         self.assertEqual(adapter._burst_drop_gap_log_threshold_s, 0.0)
 
+    async def test_monotonic_clock_immune_to_wall_clock_jump(self):
+        """Cumulative review #58: gap-delta uses ``time.monotonic`` — patching
+        ``time.time`` to simulate an NTP forward jump must NOT trigger a
+        spurious gap log if monotonic time hasn't advanced past the threshold.
+
+        This is the regression guard for the wall-clock-vs-monotonic pivot.
+        Before the fix, a Pi resuming from suspend (wall-clock catch-up) or
+        an NTP step would emit false-positive gap candidates; now only
+        true elapsed process-time matters.
+        """
+        adapter = self._adapter(burst_drop_gap_log_threshold_s=30.0)
+        records, teardown = _capture_kimi_log_records(level=logging.INFO)
+        try:
+            with patch("kimi_adapter.time.monotonic") as mock_mono:
+                # Simulate 1 second elapsed in monotonic time, but...
+                mock_mono.return_value = 100.0
+                await adapter._on_group_event(
+                    self._msg("room-Q", "19dc9c4d-93c2-87b8-8000-0a4a0ecd76fe")
+                )
+                # ...wall-clock would have jumped 60s (NTP / suspend resume).
+                # We only patch monotonic — wall-clock is irrelevant to the
+                # delta calc now that #58 fixed the timestamp source. If we
+                # ever regress to time.time() this test would fail because
+                # the test wouldn't be controlling the relevant clock.
+                mock_mono.return_value = 101.0  # 1s elapsed monotonic
+                await adapter._on_group_event(
+                    self._msg("room-Q", "19dc9c4f-1262-8c1b-8000-0a4a6c626bbb")
+                )
+        finally:
+            teardown()
+        gap = [r for r in records if "gap candidate" in r.getMessage()]
+        self.assertEqual(
+            gap, [],
+            "1s monotonic elapsed must not trigger 30s threshold even if "
+            "wall-clock jumped — proves time.monotonic is the timestamp source",
+        )
+
 
 class GroupSubscribeReconnectCounterTests(unittest.TestCase):
-    """Phase 0 (#18): reconnect counter starts at 0 and is exposed on adapter."""
+    """Phase 0 (#18): reconnect counter starts at 0 and is exposed on adapter.
+
+    Cumulative review #58 (Claude code-reviewer + Codex challenge) flagged
+    an off-by-one in ``_group_subscribe_once``: the counter was incremented
+    AFTER ``_on_group_event`` was awaited, so the gap log inside dispatch
+    saw the prior cycle's count while the ``subscribe stream live`` log
+    emitted moments later carried the new count — defeating in-line
+    correlation. Fix: bump pre-dispatch. The end-to-end integration test
+    that drives ``_group_subscribe_once`` with mocked WS layers is tracked
+    as task #61; the unit invariant below documents the post-bump
+    behaviour any regression would fail.
+    """
 
     def test_counter_initialised_to_zero(self):
         adapter = KimiAdapter(_cfg())
         self.assertEqual(adapter._group_subscribe_reconnect_count, 0)
+        # Sentinel for "no reconnect observed yet" — used by gap-log
+        # since_reconnect_s correlation. Monotonic time is always >= 0,
+        # so -1 is safely outside the legitimate value range.
+        self.assertEqual(adapter._group_subscribe_last_reconnect_ts, -1.0)
 
     def test_counter_attribute_exists_for_log_format_consumers(self):
         """Documents that the counter is a public-shape attribute used in the
@@ -3216,6 +3297,83 @@ class GroupSubscribeReconnectCounterTests(unittest.TestCase):
         gap-candidate INFOs against this would lose their anchor."""
         adapter = KimiAdapter(_cfg())
         self.assertIsInstance(adapter._group_subscribe_reconnect_count, int)
+
+
+class ConnectCounterOrderingInvariantTests(unittest.IsolatedAsyncioTestCase):
+    """Cumulative review #58: documents the post-bump invariant the
+    ``_group_subscribe_once`` fix must preserve.
+
+    The actual subscribe-loop integration test is deferred to #61 (heavy
+    WS mocks). This class instead asserts: GIVEN the counter is bumped
+    pre-dispatch (as the new code does), THEN ``_on_group_event``'s gap
+    log uses the bumped value. A regression that moves the bump back to
+    post-dispatch would still pass these tests; it would fail the deferred
+    integration test under #61, which is why the sequencing is documented
+    in the class docstring rather than spread across files.
+    """
+
+    def _adapter(self, **cfg):
+        adapter = KimiAdapter(_cfg(group_allow_bot_senders="all", **cfg))
+        adapter.handle_message = AsyncMock()  # type: ignore
+        adapter._hydrate_missing_text = False
+        return adapter
+
+    @staticmethod
+    def _msg(chat_id: str, message_id: str):
+        return {
+            "chatMessage": {
+                "chatId": chat_id,
+                "messageId": message_id,
+                "status": "STATUS_COMPLETED",
+                "role": "ROLE_USER",
+                "senderId": "u1",
+                "senderShortId": "u_real",
+                "blocks": [{"content": {"case": "text", "value": {"content": "hi"}}}],
+            }
+        }
+
+    async def test_gap_log_reads_post_bump_counter(self):
+        """If the counter is bumped before dispatch (mirroring the new
+        ``_group_subscribe_once`` ordering), the gap-candidate log inside
+        ``_on_group_event`` sees the bumped value. With the OLD ordering,
+        the log would carry connect#=0 while the ``subscribe stream live``
+        log emitted seconds later would carry connect#=1 for the same
+        first-frame event."""
+        adapter = self._adapter(burst_drop_gap_log_threshold_s=10.0)
+        # Simulate the new pre-dispatch bump exactly as
+        # _group_subscribe_once now does it.
+        adapter._group_subscribe_frame_since_connect = True
+        adapter._group_subscribe_reconnect_count += 1  # 0 -> 1
+        adapter._group_subscribe_last_reconnect_ts = 100.0  # monotonic
+
+        records, teardown = _capture_kimi_log_records(level=logging.INFO)
+        try:
+            with patch("kimi_adapter.time.monotonic") as mock_mono:
+                # Two arrivals 50s apart on monotonic clock → trips the
+                # 10s threshold and emits the gap-candidate INFO log.
+                mock_mono.return_value = 100.0
+                await adapter._on_group_event(
+                    self._msg("room-K", "19dc9c4d-93c2-87b8-8000-0a4a0ecd76fe")
+                )
+                mock_mono.return_value = 150.0
+                await adapter._on_group_event(
+                    self._msg("room-K", "19dc9c4f-1262-8c1b-8000-0a4a6c626bbb")
+                )
+        finally:
+            teardown()
+
+        gap = [r for r in records if "gap candidate" in r.getMessage()]
+        self.assertEqual(len(gap), 1)
+        rendered = gap[0].getMessage()
+        # Critical assertion: gap log saw the BUMPED counter, not 0.
+        self.assertIn(
+            "connect#=1", rendered,
+            "Gap log must reflect the post-bump counter — if this asserts "
+            "connect#=0 instead, the off-by-one regressed (#58)",
+        )
+        # since_reconnect_s = 50 (150 - 100) confirms the monotonic ts is
+        # also being read post-bump.
+        self.assertIn("since_reconnect_s=50.0", rendered)
 
 
 class ListGroupMessagesPaginationTests(unittest.IsolatedAsyncioTestCase):
@@ -3240,7 +3398,9 @@ class ListGroupMessagesPaginationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(result), 2)
         self.assertEqual(adapter._rpc_unary.await_count, 1)
         first_call_body = adapter._rpc_unary.await_args[0][1]
-        self.assertEqual(first_call_body["pageToken"], "")
+        # First page omits pageToken entirely (cumulative review #58 fix —
+        # was previously sent as empty string; mirrors list_group_files).
+        self.assertNotIn("pageToken", first_call_body)
 
     async def test_multi_page_follows_token(self):
         """``max_pages>1`` follows ``nextPageToken`` until empty."""
@@ -3287,6 +3447,96 @@ class ListGroupMessagesPaginationTests(unittest.IsolatedAsyncioTestCase):
         adapter = self._adapter()
         with self.assertRaises(ValueError):
             await adapter.list_group_messages("room-1", max_pages=0)
+
+    async def test_anchor_only_on_first_page(self):
+        """Cumulative review #58 (Kimi review): anchor IDs (start_message_id /
+        end_message_id) must be sent ONLY on the first request. Once
+        ``pageToken`` is in play, the server-issued cursor encodes
+        everything; echoing anchors alongside the cursor risks duplicate
+        results or undefined ordering. Mirrors the conditional pageToken
+        injection in ``list_group_files``.
+        """
+        adapter = self._adapter()
+        adapter._rpc_unary.side_effect = [
+            {"messages": [{"messageId": "m1"}], "nextPageToken": "tok2"},
+            {"messages": [{"messageId": "m2"}], "nextPageToken": "tok3"},
+            {"messages": [{"messageId": "m3"}], "nextPageToken": ""},
+        ]
+        await adapter.list_group_messages(
+            "room-1",
+            max_pages=5,
+            start_message_id="anchor-start",
+            end_message_id="anchor-end",
+        )
+        # First call: anchors present, no pageToken.
+        first_body = adapter._rpc_unary.await_args_list[0][0][1]
+        self.assertEqual(first_body.get("startMessageId"), "anchor-start")
+        self.assertEqual(first_body.get("endMessageId"), "anchor-end")
+        self.assertNotIn("pageToken", first_body)
+        # Subsequent calls: pageToken present, anchors absent.
+        for idx in (1, 2):
+            body = adapter._rpc_unary.await_args_list[idx][0][1]
+            self.assertNotIn(
+                "startMessageId", body,
+                f"page {idx} must not echo startMessageId alongside pageToken",
+            )
+            self.assertNotIn(
+                "endMessageId", body,
+                f"page {idx} must not echo endMessageId alongside pageToken",
+            )
+            self.assertTrue(body.get("pageToken"), "page 2+ must carry cursor")
+
+
+class FetchGroupMessagePaginationTests(unittest.IsolatedAsyncioTestCase):
+    """#60 fold-in: ``_fetch_group_message`` raises max_pages=2 so a tight
+    ``start=end=message_id`` window that Kimi paginates around is still
+    found rather than silently returning None. Safe given the
+    anchor-only-on-first-page fix above (cumulative review #58)."""
+
+    def _adapter(self):
+        adapter = KimiAdapter(_cfg())
+        adapter._rpc_unary = AsyncMock()  # type: ignore
+        return adapter
+
+    async def test_fetch_passes_max_pages_2_to_list_group_messages(self):
+        """``_fetch_group_message`` must call ``list_group_messages`` with
+        ``max_pages=2`` so a single follow-up page is permitted."""
+        adapter = self._adapter()
+        adapter.list_group_messages = AsyncMock(return_value=[])  # type: ignore
+        await adapter._fetch_group_message("room-1", "msg-target")
+        adapter.list_group_messages.assert_awaited_once()
+        kwargs = adapter.list_group_messages.await_args.kwargs
+        self.assertEqual(kwargs.get("max_pages"), 2)
+        self.assertEqual(kwargs.get("start_message_id"), "msg-target")
+        self.assertEqual(kwargs.get("end_message_id"), "msg-target")
+
+    async def test_fetch_finds_message_on_second_page(self):
+        """If Kimi paginates the tight-range window such that the target
+        appears on page 2, ``_fetch_group_message`` returns it (not None)."""
+        adapter = self._adapter()
+        # Page 1: unrelated message + nextPageToken.
+        # Page 2: the target.
+        adapter._rpc_unary.side_effect = [
+            {
+                "messages": [{
+                    "messageId": "msg-other",
+                    "message": {"id": "msg-other", "blocks": []},
+                }],
+                "nextPageToken": "tok-page2",
+            },
+            {
+                "messages": [{
+                    "messageId": "msg-target",
+                    "senderId": "u1",
+                    "message": {"id": "msg-target", "blocks": []},
+                }],
+                "nextPageToken": "",
+            },
+        ]
+        result = await adapter._fetch_group_message("room-1", "msg-target")
+        self.assertIsNotNone(result)
+        # Two RPC calls confirm the second-page traversal.
+        self.assertEqual(adapter._rpc_unary.await_count, 2)
 
 
 class HakimiLift3aDropLogTests(unittest.IsolatedAsyncioTestCase):
@@ -3705,6 +3955,87 @@ class RoomCacheCapIntegrationTests(unittest.TestCase):
         adapter._last_message_id_per_room["new-room"] = "msg-fresh"
         self.assertIn("busy", adapter._last_message_id_per_room)
         self.assertNotIn("idle-a", adapter._last_message_id_per_room)
+
+
+class ArrivalTimeCacheCapTests(unittest.TestCase):
+    """Cumulative review #58 (Codex lead): ``_last_arrival_time_per_room``
+    is bounded INDEPENDENTLY of the shared ``room_cache_max_entries`` cap.
+
+    Sharing the 500-entry cap with the other per-room dicts would silently
+    blind the Phase 0 gap-candidate log under cardinality pressure: an
+    evicted arrival-time entry produces ``prev_arrival=None`` on the next
+    message, suppressing the INFO log regardless of actual delay. Codex
+    framed it as a contradiction with the ``_BoundedLRU`` "no load-bearing
+    state" promise — fixed here by giving arrival-time tracking its own
+    ceiling that's effectively unbounded for any realistic deployment
+    (10000 entries × ~16 bytes ≈ 160KB).
+    """
+
+    def test_default_arrival_cap_is_separate_and_larger(self):
+        """No config override → arrival dict at 10000, room dict at 500."""
+        adapter = KimiAdapter(_cfg())
+        self.assertIsInstance(adapter._last_arrival_time_per_room, _BoundedLRU)
+        self.assertEqual(
+            adapter._last_arrival_time_per_room._maxsize,
+            _ARRIVAL_TIME_CACHE_DEFAULT_MAX,
+        )
+        # Crucially: NOT the same as _ROOM_CACHE_DEFAULT_MAX.
+        self.assertNotEqual(
+            adapter._last_arrival_time_per_room._maxsize,
+            adapter._rooms._maxsize,
+            "arrival-time cap must be distinct from shared room cap — "
+            "Codex review #58 lead objection",
+        )
+        self.assertGreater(
+            adapter._last_arrival_time_per_room._maxsize,
+            adapter._rooms._maxsize,
+            "arrival-time cap must be larger so eviction is unreachable "
+            "in any realistic deployment",
+        )
+
+    def test_arrival_cap_config_override_independent(self):
+        """``arrival_time_cache_max_entries`` plumbs to the arrival dict
+        without affecting ``room_cache_max_entries``."""
+        adapter = KimiAdapter(_cfg(
+            room_cache_max_entries=42,
+            arrival_time_cache_max_entries=999,
+        ))
+        self.assertEqual(adapter._rooms._maxsize, 42)
+        self.assertEqual(adapter._last_message_id_per_room._maxsize, 42)
+        self.assertEqual(adapter._last_arrival_time_per_room._maxsize, 999)
+
+    def test_arrival_cap_invalid_falls_back_to_default(self):
+        """Garbage in config doesn't crash startup; default applies + warning."""
+        adapter = KimiAdapter(_cfg(arrival_time_cache_max_entries="not-an-int"))
+        self.assertEqual(
+            adapter._last_arrival_time_per_room._maxsize,
+            _ARRIVAL_TIME_CACHE_DEFAULT_MAX,
+        )
+
+    def test_arrival_cap_negative_or_zero_clamped_to_one(self):
+        """Same defensive ``max(1, int(...))`` floor as the room cap."""
+        a0 = KimiAdapter(_cfg(arrival_time_cache_max_entries=0))
+        self.assertEqual(a0._last_arrival_time_per_room._maxsize, 1)
+        a_neg = KimiAdapter(_cfg(arrival_time_cache_max_entries=-7))
+        self.assertEqual(a_neg._last_arrival_time_per_room._maxsize, 1)
+
+    def test_eviction_with_separate_caps_doesnt_cross_dicts(self):
+        """Inserting past one dict's cap evicts only from that dict —
+        proves the caps are truly independent, not aliased to a single
+        shared cap. Regression guard against an accidental refactor that
+        re-merges the caps."""
+        adapter = KimiAdapter(_cfg(
+            room_cache_max_entries=2,
+            arrival_time_cache_max_entries=4,
+        ))
+        # Push past the ROOM cap (2) but stay under the ARRIVAL cap (4).
+        for i in range(3):
+            adapter._rooms[f"room-{i}"] = object()
+            adapter._last_arrival_time_per_room[f"room-{i}"] = float(i)
+        self.assertEqual(len(adapter._rooms), 2)  # evicted room-0
+        self.assertEqual(len(adapter._last_arrival_time_per_room), 3)  # still has all
+        self.assertIn("room-0", adapter._last_arrival_time_per_room,
+                      "arrival-dict must NOT be evicted at the room-cap boundary")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

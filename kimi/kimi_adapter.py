@@ -165,6 +165,22 @@ _DEDUP_MAXLEN = 2000
 # ``config.extra["room_cache_max_entries"]``.
 _ROOM_CACHE_DEFAULT_MAX = 500
 
+# Phase 0 burst-drop instrumentation: arrival-time cache is bounded too,
+# but at a much higher ceiling than the other per-room dicts. Codex review
+# #58 noted that sharing the 500-entry cap with ``_rooms`` /
+# ``_last_message_id_per_room`` / ``_probe_msg_id_room_counts`` would
+# *silently neuter* the gap-candidate log under cardinality pressure: an
+# evicted arrival-time entry yields ``prev_arrival=None`` on the next
+# message → no INFO log fires regardless of actual delay. Since gap
+# detection is correctness-critical for observability (the very signal
+# Phase 0 ships to gather), this dict gets its own cap that's effectively
+# unbounded for any realistic Kimi deployment. 10000 entries × ~16 bytes
+# (room_id key + monotonic float) ≈ 160KB — negligible. Override via
+# ``config.extra["arrival_time_cache_max_entries"]`` on the rare deployment
+# that exceeds 10000 distinct rooms; consider Phase 1 recovery dispatch
+# at that point because 10000+ rooms is a different scale problem entirely.
+_ARRIVAL_TIME_CACHE_DEFAULT_MAX = 10000
+
 # Kimi file upload/download tuning.
 _FILE_UPLOAD_MAX_PATHS = 5
 _FILE_UPLOAD_TIMEOUT_S_DEFAULT = 120.0
@@ -839,10 +855,11 @@ class _BoundedLRU(OrderedDict):
     """``OrderedDict`` with a hard size cap; oldest entry evicted on overflow.
 
     Used for the adapter's per-room state dicts (``_rooms``,
-    ``_last_message_id_per_room``, ``_probe_msg_id_room_counts``) so the
-    plugin stays bounded under arbitrary room cardinality. Reads do **not**
-    refresh order — only writes. "Least recently used" → "least recently
-    *updated*", which is the right semantics for our consumers:
+    ``_last_message_id_per_room``, ``_probe_msg_id_room_counts``, and
+    ``_last_arrival_time_per_room``) so the plugin stays bounded under
+    arbitrary room cardinality. Reads do **not** refresh order — only
+    writes. "Least recently used" → "least recently *updated*", which is
+    the right semantics for our consumers:
 
     - ``_last_message_id_per_room`` is written every inbound group message,
       so a busy room naturally refreshes its position; idle rooms drift
@@ -855,11 +872,23 @@ class _BoundedLRU(OrderedDict):
       eviction key, which is exactly what we want for a TTL-managed cache.
     - ``_probe_msg_id_room_counts`` reads and writes at the same call site
       (increment-then-store), so the read/write distinction is irrelevant.
+    - ``_last_arrival_time_per_room`` writes monotonic timestamps every
+      inbound chatMessage. The same write-on-message pattern as
+      ``_last_message_id_per_room`` keeps the access semantics symmetric.
+      **It uses its own larger cap** (``_ARRIVAL_TIME_CACHE_DEFAULT_MAX``,
+      default 10000) rather than the shared 500-entry cap because eviction
+      blinds the Phase 0 gap-candidate log — a re-cached room produces
+      ``prev_arrival=None`` and the gap log won't fire no matter how
+      large the actual delay was. Codex review #58 flagged this as a
+      contradiction with the "no load-bearing state" disclaimer below;
+      the separate cap resolves it.
 
     None of these dicts hold *message-dispatch* correctness state — replay
     dedup is owned by ``_processed_set``, which is independently bounded by
     ``_DEDUP_MAXLEN``. So eviction never causes a duplicate or dropped
-    message at the agent layer.
+    message at the agent layer. The arrival-time dict above is the lone
+    *observability*-critical user; it gets a higher cap to keep the
+    "bounded" promise meaningful in practice.
 
     Eviction *does* have observable side effects under cardinality pressure
     that we accept as the cost of bounded growth:
@@ -1169,14 +1198,33 @@ class KimiAdapter(BasePlatformAdapter):
             self._probe_msg_id_sample_rate = 1
         self._probe_msg_id_room_counts: _BoundedLRU = _BoundedLRU(maxsize=_room_cap)
 
-        # Phase 0 burst-drop instrumentation: per-room wall-clock arrival
-        # tracking + INFO threshold. Tracks ``time.time()`` at the moment
-        # each chatMessage is processed in ``_on_group_event``; logs at INFO
-        # when the per-room delta meets the threshold. Wall-clock (not
-        # monotonic) because operators correlate against ISO timestamps in
-        # journalctl, not against process-uptime. Same key space + cap as
-        # the other per-room dicts (see ``_BoundedLRU`` discussion above).
-        self._last_arrival_time_per_room: _BoundedLRU = _BoundedLRU(maxsize=_room_cap)
+        # Phase 0 burst-drop instrumentation: per-room MONOTONIC arrival
+        # tracking + INFO threshold. Tracks ``time.monotonic()`` at the
+        # moment each chatMessage is processed in ``_on_group_event``;
+        # logs at INFO when the per-room delta meets the threshold.
+        # Monotonic (not wall-clock) because deltas need to be safe
+        # against NTP step / leap-second / VM-suspend resume — Codex and
+        # Kimi reviews #58 independently flagged that ``time.time()``-
+        # based deltas can produce false-positive gap logs when the
+        # system clock jumps. Operator correlation with journalctl
+        # timestamps still works via the log line's own leading ISO
+        # timestamp; the embedded delta describes "process-time since
+        # last delivery" which is the honest signal. Higher cap than
+        # the shared LRU (see ``_ARRIVAL_TIME_CACHE_DEFAULT_MAX``) to
+        # keep gap detection unblinded under cardinality pressure.
+        _raw_arrival_cap = config.extra.get(
+            "arrival_time_cache_max_entries", _ARRIVAL_TIME_CACHE_DEFAULT_MAX
+        )
+        try:
+            _arrival_cap = max(1, int(_raw_arrival_cap))
+        except (TypeError, ValueError):
+            logger.warning(
+                "Kimi: invalid arrival_time_cache_max_entries=%r in config.extra "
+                "— expected positive integer, falling back to %d",
+                _raw_arrival_cap, _ARRIVAL_TIME_CACHE_DEFAULT_MAX,
+            )
+            _arrival_cap = _ARRIVAL_TIME_CACHE_DEFAULT_MAX
+        self._last_arrival_time_per_room: _BoundedLRU = _BoundedLRU(maxsize=_arrival_cap)
 
         # Threshold in seconds for emitting the gap-candidate INFO log. 0
         # disables. Default 30 — well above conversational cadence (humans
@@ -1779,12 +1827,23 @@ class KimiAdapter(BasePlatformAdapter):
                 "direction": direction,
                 "includeStartMessage": include_start_message,
                 "includeEndMessage": include_end_message,
-                "pageToken": page_token,
             }
-            if start_message_id:
-                body["startMessageId"] = start_message_id
-            if end_message_id:
-                body["endMessageId"] = end_message_id
+            # ``pageToken`` and ``startMessageId``/``endMessageId`` are
+            # mutually-exclusive cursoring modes: on page 0 (no token yet)
+            # the anchors define the window; on page 1+ the server-issued
+            # ``pageToken`` encodes everything needed to continue.
+            # Echoing anchors alongside ``pageToken`` is what Kimi review
+            # #58 flagged as risking duplicate results / undefined ordering
+            # — and it's the precondition for ``_fetch_group_message``
+            # to safely raise ``max_pages`` above 1. Mirrors the conditional
+            # ``pageToken`` injection in ``list_group_files`` below.
+            if page_token:
+                body["pageToken"] = page_token
+            else:
+                if start_message_id:
+                    body["startMessageId"] = start_message_id
+                if end_message_id:
+                    body["endMessageId"] = end_message_id
             resp = await self._rpc_unary("ListMessages", body)
             messages = resp.get("messages")
             if isinstance(messages, list):
@@ -2456,20 +2515,48 @@ class KimiAdapter(BasePlatformAdapter):
                         # events can't satisfy the first-frame hook.
                         case, _ = _event_payload(event) if isinstance(event, dict) else (None, {})
                         is_chat_message = case == "chatMessage"
-                        await self._on_group_event(event)
-                        # First-frame hook runs AFTER successful dispatch AND
-                        # only for chatMessage events. Keepalive pings, typing
-                        # events, and unsupported shapes must NOT reset backoff
-                        # — a degraded Subscribe stream emitting only pings
-                        # would otherwise thrash back to the floor each cycle.
-                        # If _on_group_event raises, we never reach this block
-                        # (exception propagates to the handlers below) — so
-                        # the state flip and log only fire on genuine recovery.
-                        if is_chat_message and not self._group_subscribe_frame_since_connect:
+                        # Detect "first chatMessage of this cycle" BEFORE
+                        # dispatch so the gap-candidate log inside
+                        # ``_on_group_event`` reads the *correct* connect#
+                        # and ``last_reconnect_ts`` for in-line correlation.
+                        # Claude code-reviewer #58 + Codex challenge #58 both
+                        # flagged the prior post-dispatch ordering as an
+                        # off-by-one: gap log carrying ``connect#=N-1`` while
+                        # the subscribe-stream-live log emitted moments later
+                        # carried ``connect#=N`` for the same boundary
+                        # event — defeats the design goal of in-line
+                        # correlation without grepping two log streams.
+                        is_first_chat_post_connect = (
+                            is_chat_message
+                            and not self._group_subscribe_frame_since_connect
+                        )
+                        if is_first_chat_post_connect:
+                            # Counter + ts represent "stream received its
+                            # first non-control frame this cycle". That
+                            # fact is true even if the dispatch below
+                            # raises and the cycle ends — the subsequent
+                            # reconnect+first-frame produces another bump,
+                            # giving honest cycle counts. Frame gate flips
+                            # synchronously to prevent re-entry within the
+                            # same cycle if a second chatMessage arrives.
                             self._group_subscribe_frame_since_connect = True
-                            prev_backoff = self._group_subscribe_backoff
                             self._group_subscribe_reconnect_count += 1
-                            self._group_subscribe_last_reconnect_ts = time.time()
+                            self._group_subscribe_last_reconnect_ts = (
+                                time.monotonic()
+                            )
+                            prev_backoff = self._group_subscribe_backoff
+                        await self._on_group_event(event)
+                        # Subscribe-live log + backoff clamp run AFTER
+                        # dispatch. They gate on processing success
+                        # (a raise inside ``_on_group_event`` exits via
+                        # the except clauses below, skipping these). This
+                        # preserves the original semantic that operator-
+                        # facing "stream recovered" messages only fire on
+                        # genuine recovery — degraded streams emitting
+                        # only pings still won't reach this block because
+                        # the first-frame check above requires
+                        # ``is_chat_message``.
+                        if is_first_chat_post_connect:
                             # Phase 0 burst-drop instrumentation: snapshot the
                             # adapter's per-room state at the first chatMessage
                             # post-connect. This is the candidate "Phase 1
@@ -2611,41 +2698,46 @@ class KimiAdapter(BasePlatformAdapter):
         prev_id = self._last_message_id_per_room.get(room_key)
         self._last_message_id_per_room[room_key] = this_id_str
 
-        # Phase 0 burst-drop instrumentation: track wall-clock ARRIVAL time
+        # Phase 0 burst-drop instrumentation: track MONOTONIC arrival time
         # per room, not the ULID-embedded timestamp. Two reasons: (1) Kimi's
         # production message ids are UUID v8 with a non-standard epoch (their
         # first 48 bits aren't unix-ms — captured deltas show ~16× the
-        # wall-clock interval). (2) Even if the encoding were unix-ms, gap-
-        # candidate signal is fundamentally about "how long did the adapter
-        # wait between successive deliveries?" — wall-clock at receive time
-        # answers that directly, without depending on Kimi's id format.
-        # ``time.time()`` is wall-clock seconds (not monotonic) but adequate
-        # here: monotonic time has no human meaning for journalctl correlation,
-        # and clock-skew during a single python process runtime is bounded.
-        now_wall_s = time.time()
+        # wall-clock interval), so id-derived deltas are nonsense in
+        # production. (2) ``time.monotonic()`` is the right primitive for
+        # "how long since last delivery": it never goes backward, never
+        # jumps on NTP sync or VM suspend/resume, and is immune to leap-
+        # second adjustments. Codex review #1 + Kimi review #2 (#58)
+        # independently flagged ``time.time()``-based deltas as a false-
+        # positive risk under clock skew. The log line's own leading ISO
+        # timestamp gives operators wall-clock correlation; the embedded
+        # delta is honestly "process-time since last delivery".
+        now_mono_s = time.monotonic()
         prev_arrival = self._last_arrival_time_per_room.get(room_key)
-        self._last_arrival_time_per_room[room_key] = now_wall_s
+        self._last_arrival_time_per_room[room_key] = now_mono_s
 
-        wall_delta_s: Optional[float] = None
+        arrival_delta_s: Optional[float] = None
         if prev_arrival is not None:
-            wall_delta_s = now_wall_s - prev_arrival
+            arrival_delta_s = now_mono_s - prev_arrival
             if (
                 self._burst_drop_gap_log_threshold_s > 0
-                and wall_delta_s >= self._burst_drop_gap_log_threshold_s
+                and arrival_delta_s >= self._burst_drop_gap_log_threshold_s
             ):
                 # Include since-last-reconnect so operators can correlate gap
                 # candidates against reconnect events without grepping two
-                # log streams. -1 means "no reconnect observed yet this
-                # process" (cold start before first chatMessage).
+                # log streams. ``-1.0`` sentinel = "no reconnect observed
+                # yet this process" (cold start before first chatMessage).
+                # Both timestamps are monotonic so the subtraction is safe.
                 if self._group_subscribe_last_reconnect_ts > 0:
-                    since_reconnect_s = now_wall_s - self._group_subscribe_last_reconnect_ts
+                    since_reconnect_s = (
+                        now_mono_s - self._group_subscribe_last_reconnect_ts
+                    )
                     correlation = f"since_reconnect_s={since_reconnect_s:.1f}"
                 else:
                     correlation = "since_reconnect_s=N/A"
                 logger.info(
                     "Kimi groups: gap candidate room=%s id=%s prev=%s "
                     "delta_s=%.1f (>=%.1fs threshold) %s connect#=%d",
-                    chat_id, message_id, prev_id, wall_delta_s,
+                    chat_id, message_id, prev_id, arrival_delta_s,
                     self._burst_drop_gap_log_threshold_s,
                     correlation,
                     self._group_subscribe_reconnect_count,
@@ -2990,7 +3082,16 @@ class KimiAdapter(BasePlatformAdapter):
         chat_id: str,
         message_id: str,
     ) -> Optional[Dict[str, Any]]:
-        """Fetch a full message wrapper when Subscribe only carries a summary."""
+        """Fetch a full message wrapper when Subscribe only carries a summary.
+
+        Sets ``max_pages=2`` so that if Kimi paginates around a tight
+        ``start=end=message_id`` window (Codex impl #4 in #18), we still
+        find the message rather than silently returning ``None``. Safe
+        because ``list_group_messages`` no longer echoes the anchor on
+        follow-up pages (Kimi review #58 fix above) — page 1 follows the
+        opaque cursor only, so the second request has the same effective
+        scope without anchor/cursor ambiguity.
+        """
         wrappers = await self.list_group_messages(
             chat_id,
             limit=20,
@@ -2998,6 +3099,7 @@ class KimiAdapter(BasePlatformAdapter):
             end_message_id=message_id,
             include_start_message=True,
             include_end_message=True,
+            max_pages=2,
         )
         for wrapper in wrappers:
             message = wrapper.get("message") if isinstance(wrapper.get("message"), dict) else {}

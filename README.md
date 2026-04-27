@@ -101,8 +101,7 @@ If you don't see the `register_platform_adapter` line, the hook isn't present in
 | **Slash commands** | Pass-through to the Hermes runtime | `/new`, `/compact`, `/status`, etc. handled at the runtime layer. |
 | **Tool calls** | Native streaming via session/update | Tool-call frames are forwarded to the Kimi UI without being filtered. |
 | **Output modes** | `output_mode: tool_only \| passthrough` | `tool_only` suppresses agent text in favour of `SendMessage` tool calls (matches the hakimi pattern). Default is `passthrough`. See [Picking an output_mode](#picking-an-output_mode) below. |
-| **Bounded room state** | `_BoundedLRU(maxsize=N)` on `_rooms`, `_last_message_id_per_room`, `_probe_msg_id_room_counts` | Per-room dicts cap at `room_cache_max_entries` entries (default 500). Eviction does NOT affect message-dispatch correctness (replay-dedup is owned by `_processed_set`, separately bounded). It does have observable side effects under cardinality pressure — see [Bounded room state](#bounded-room-state) below. |
-| **Burst-drop instrumentation** | Gap-candidate INFO logs + reconnect counter + paginated `list_group_messages` | Gathers evidence for whether suspicious per-room timing gaps cluster around stream reconnects. Does NOT recover messages — that's a future Phase 1+. See [Burst-drop instrumentation](#burst-drop-instrumentation) below. |
+| **Bounded room state** | `_BoundedLRU(maxsize=N)` on four per-room dicts | `_rooms`, `_last_message_id_per_room`, `_probe_msg_id_room_counts` share `room_cache_max_entries` (default 500); `_last_arrival_time_per_room` uses its own larger `arrival_time_cache_max_entries` (default 10000) because eviction would silently blind gap detection. Eviction never affects message-dispatch correctness — replay dedup is owned by `_processed_set`, separately bounded. See [Bounded room state](#bounded-room-state) below. |
 | **Onboarding skill** | Embedded `optional-skills/communication/kimi-platform/` | Once enabled in skill settings, agents get a brief on Kimi-specific behaviours (group vs DM, slash semantics, etc.). |
 
 ### Picking an `output_mode`
@@ -132,63 +131,28 @@ This flag exists because the bridge's previous workaround (`HIDE_TOOL_CALLS=1`) 
 
 ### Bounded room state
 
-Three of the adapter's per-room dicts (`_rooms`, `_last_message_id_per_room`, `_probe_msg_id_room_counts`) used to grow without ceiling on long-running deployments. They're now backed by `_BoundedLRU` with a configurable cap (`room_cache_max_entries`, default 500). The cap is **per-dict**, but all three share the same `room_id` key space so cardinality is symmetric.
+Four of the adapter's per-room dicts are backed by `_BoundedLRU` so cardinality can't grow without ceiling on long-running deployments:
+
+- **Shared cap** (`room_cache_max_entries`, default 500) — `_rooms`, `_last_message_id_per_room`, `_probe_msg_id_room_counts`. All three share the same `room_id` key space and have non-load-bearing eviction semantics.
+- **Larger separate cap** (`arrival_time_cache_max_entries`, default 10000) — `_last_arrival_time_per_room`. Eviction would silently blind the Phase 0 gap-candidate log (next message produces `prev_arrival=None` and the INFO log won't fire regardless of actual delay). Codex review #58 flagged this as a contradiction with the "no load-bearing state" promise; the separate higher cap resolves it without making memory unbounded — 10000 entries × ~16 bytes ≈ 160KB, effectively unbounded for any realistic deployment.
 
 **What eviction never breaks:** message-dispatch correctness. Replay dedup is owned by `_processed_set`, which is bounded by `_DEDUP_MAXLEN=2000` independently. Whether a room's metadata is in `_rooms` or not has zero bearing on whether the agent sees a duplicate or dropped message.
 
-**What eviction *does* affect** under cardinality pressure (≥ cap rooms ever encountered):
+**What eviction *does* affect** under cardinality pressure (≥ shared cap rooms ever encountered):
 
 1. **`first-seen` DEBUG log on resumed rooms.** `_last_message_id_per_room` is hoisted out of the DEBUG gate so toggling DEBUG on later doesn't produce a misleading `first-seen`. Eviction reintroduces a narrower version of that artifact: a quiet room evicted then resumed will log `first-seen` instead of a delta on its first message back. Misleading observability, not misleading state.
 2. **Probe sample-phase reset.** `_probe_msg_id_room_counts` keys its DEBUG sampling phase off the count modulo `probe_msg_id_sample_rate`. After eviction the count restarts at 1, so the first `sample_rate - 1` resumed messages are skipped from the DEBUG sample.
 3. **Cold-resume RPC failure.** `_rooms` re-fetches a missing entry via `GetRoom` + `ListMembers`; on transient `KimiAdapterError` the fallback returns `{"name": room_id, "type": "group"}` with no members. Without eviction, that fallback only runs for *never-cached* rooms; with eviction, a failed re-fetch on a previously-cached room can briefly degrade display name + members until the next successful refresh.
 
-For Bloom's typical Pi deployment (~10 unique rooms over weeks) none of these ever fire. For deployments with hundreds-to-thousands of rooms, raise the cap:
+For Bloom's typical Pi deployment (~10 unique rooms over weeks) none of these ever fire. For deployments with hundreds-to-thousands of rooms, raise the caps:
 
 ```yaml
 platforms:
   kimi:
     extra:
       room_cache_max_entries: 5000
+      arrival_time_cache_max_entries: 50000   # only if >10000 distinct rooms
 ```
-
-### Burst-drop instrumentation
-
-Three INFO-level signals gather evidence about message-loss patterns *without* recovering anything. They exist so a future Phase 1+ recovery design can be picked against real production data instead of assumed traffic patterns.
-
-**1. Gap-candidate INFO log.** Tracks **wall-clock arrival time** per room (`time.time()` at the moment each `chatMessage` is processed by the adapter). When the delta between consecutive arrivals in a room is `≥ burst_drop_gap_log_threshold_s` (default 30s, set to 0 to disable):
-
-```
-INFO Kimi groups: gap candidate room=<chat_id> id=<this_id> prev=<prev_id> delta_s=N.N (>=30.0s threshold) since_reconnect_s=K.K connect#=M
-```
-
-Note: this is **wall-clock arrival delta**, not Kimi-`messageId`-embedded timestamp delta. Kimi's production message ids are UUID v8 with a non-standard epoch (their first 48 bits decode to magnitudes ~16× wall-clock seconds), so id-based timestamps are unreliable for time-domain analysis. Wall-clock at receive time is the operator-meaningful signal.
-
-The `since_reconnect_s` and `connect#` fields make correlation against reconnects implicit in a single line — operators don't need to grep two log streams.
-
-This is anomaly-spotting only — most gaps are legitimate (idle room, no traffic). The signal becomes useful when **clusters** of these correlate against reconnects (low `since_reconnect_s` values in burst). At Bloom's typical traffic patterns the default 30s threshold may produce one-off false positives from human conversational pauses; raise to 60-120s if INFO noise becomes distracting.
-
-**2. Reconnect counter + snapshot log.** On the first `chatMessage` post-(re)connect:
-
-```
-INFO Kimi groups: subscribe stream live (connect#N, rooms_tracked=M, prev_backoff=X.Xs)
-```
-
-`connect#N` is monotonic over the adapter lifetime (cold start = #1). The same value also appears in every gap-candidate log line for in-line correlation.
-
-**3. Paginated `list_group_messages`.** The wrapper now follows `nextPageToken` up to a configurable `max_pages` (default 1, backward-compatible with every existing caller). Required for any future recovery design that fetches more than `limit` messages from a gap.
-
-Tunable via `config.extra`:
-
-```yaml
-platforms:
-  kimi:
-    extra:
-      burst_drop_gap_log_threshold_s: 30.0   # 0 disables the gap-candidate INFO
-      # (no config knob for the reconnect counter — always on)
-      # (max_pages is per-call; default 1)
-```
-
-This is **evidence-gathering**, not recovery. Recovery designs (Phase 1+) require a release cycle of this data first to choose between reconnect catch-up vs periodic poll vs gap-triggered.
 
 ## Production reference
 
@@ -198,6 +162,50 @@ Bloom (Xule's home Raspberry Pi) has been running this adapter against real Kimi
 - 2026-04-27 → present: as this **standalone plugin** symlinked into `~/.hermes/plugins/kimi`, against `linxule/hermes-agent:feat/platform-kimi-enum` (the upstream-equivalent base for both prospective PRs)
 
 Validated end-to-end via gateway logs showing `hermes_plugins.kimi.kimi_adapter` as the connecting module (i.e., the plugin path from this repo, not any in-tree fallback shim).
+
+## Diagnostics
+
+These are **observability** signals, not capabilities — operators read them to diagnose, but the plugin never recovers messages on the basis of them. Recovery design (Phase 1+) is gated on a release cycle of these signals from real production data.
+
+### Burst-drop instrumentation (Phase 0)
+
+Three INFO-level signals gather evidence about message-loss patterns *without* recovering anything.
+
+**1. Gap-candidate INFO log.** Tracks **monotonic arrival time** per room (`time.monotonic()` at the moment each `chatMessage` is processed by the adapter). When the delta between consecutive arrivals in a room is `≥ burst_drop_gap_log_threshold_s` (default 30s, set to 0 to disable):
+
+```
+INFO Kimi groups: gap candidate room=<chat_id> id=<this_id> prev=<prev_id> delta_s=N.N (>=30.0s threshold) since_reconnect_s=K.K connect#=M
+```
+
+`time.monotonic()` is the right primitive for "how long since last delivery" — it never goes backward, never jumps on NTP sync or VM suspend/resume, and is immune to leap-second adjustments. Wall-clock correlation comes from the log line's own leading ISO timestamp; the embedded `delta_s` is honest process-time. (Earlier wall-clock implementation switched to monotonic in #58 cumulative review after independent flags from Codex and Kimi reviewers.)
+
+This is anomaly-spotting only — most gaps are legitimate (idle room, no traffic). The signal becomes useful when **clusters** of these correlate against reconnects (low `since_reconnect_s` values in burst). At Bloom's typical traffic patterns the default 30s threshold may produce one-off false positives from human conversational pauses; raise to 60-120s if INFO noise becomes distracting.
+
+Also note: Kimi's production message ids are UUID v8 with a non-standard epoch (their first 48 bits decode to magnitudes ~16× wall-clock seconds), so id-based timestamps are unreliable for time-domain analysis. That's why the gap delta is wall-time-based, not id-derived.
+
+**2. Reconnect counter + snapshot log.** On the first `chatMessage` post-(re)connect, after the counter is bumped (the bump is now pre-dispatch in #58 to keep the gap log's `connect#` consistent with the snapshot log):
+
+```
+INFO Kimi groups: subscribe stream live (connect#N, rooms_tracked=M, prev_backoff=X.Xs)
+```
+
+`connect#N` is monotonic over the adapter lifetime (cold start = #1). The same value also appears in every gap-candidate log line for in-line correlation.
+
+**3. Paginated `list_group_messages`.** The wrapper follows `nextPageToken` up to a configurable `max_pages` (default 1, backward-compatible with every existing caller). Anchor IDs (`startMessageId` / `endMessageId`) are sent only on the first request — subsequent requests carry the opaque cursor only, avoiding the duplicate-results / undefined-ordering risk Kimi review #58 flagged. Required for any future recovery design that fetches more than `limit` messages from a gap.
+
+Tunable via `config.extra`:
+
+```yaml
+platforms:
+  kimi:
+    extra:
+      burst_drop_gap_log_threshold_s: 30.0   # 0 disables the gap-candidate INFO
+      arrival_time_cache_max_entries: 10000   # see Bounded room state above
+      # (no config knob for the reconnect counter — always on)
+      # (max_pages is per-call; default 1)
+```
+
+Recovery designs (Phase 1+) require a release cycle of this data first to choose between reconnect catch-up vs periodic poll vs gap-triggered.
 
 ## Tests
 
