@@ -6,34 +6,38 @@ Bridges Hermes Agent gateways to a single Kimi bot identity, handling **direct m
 
 ## Status
 
-> **Pending upstream merge.** This plugin requires TWO things from `hermes-agent` that aren't in vanilla upstream yet: the `register_platform_adapter` hook AND the `Platform.KIMI` enum value. The hook is currently in upstream review at [NousResearch/hermes-agent](https://github.com/NousResearch/hermes-agent); the enum addition is a separate one-line companion. Until both land, install Hermes Agent from a branch that includes both — see the install section below.
+> **Pending upstream merge.** This plugin requires three things from `hermes-agent` that aren't in vanilla upstream yet, packaged as **two upstream PRs**:
+>
+> 1. The `register_platform_adapter` hook (generic — adds the registry surface)
+> 2. The `Platform.KIMI` enum value + canonical platform-config wiring for Kimi (env-var loading in `_apply_env_overrides`, redaction-list entry, prompt hint, cron delivery, auth env-maps)
+>
+> Until both land, install Hermes Agent from a fork branch that carries them — see the install section below.
+>
+> Production reference: Bloom (Xule's Pi) has been running this plugin against `feat/platform-kimi-enum` (the clean upstream-equivalent base for both prospective PRs) since 2026-04-27. Logger module name `hermes_plugins.kimi.kimi_adapter` in gateway logs confirms the plugin path is active end-to-end.
 
 ## Install
 
 You'll need:
-1. A Hermes Agent install that includes the platform-adapter registry hook AND the `Platform.KIMI` enum value (see "Install Hermes Agent" below)
+1. A Hermes Agent install that includes the platform-adapter registry hook AND the canonical Kimi wiring (see "Install Hermes Agent" below)
 2. A Kimi bot token from your kimi.com account (Settings → Connected Apps → Generate `km_b_prod_…` token)
 
 ### Install Hermes Agent
 
-Until the registry hook AND the `Platform.KIMI` enum addition land upstream, install from a fork branch that carries both:
+The recommended install target until both upstream PRs land is `feat/platform-kimi-enum` on the linxule fork. It carries the registry hook PLUS the Kimi enum value PLUS the canonical platform wiring needed for the gateway to actually route traffic to your plugin:
 
 ```bash
-pip install 'hermes-agent @ git+https://github.com/linxule/hermes-agent.git@feat/kimi-plugin-variant'
+pip install 'hermes-agent @ git+https://github.com/linxule/hermes-agent.git@feat/platform-kimi-enum'
 ```
 
-If you want to inspect just the registry-hook diff without the Kimi plugin code in-tree, install from the hook branch instead:
+Two other branches exist for narrower inspection — both are **insufficient on their own** for running the plugin:
+
+- `hook/platform-adapter-registry`: the registry hook PR in isolation. This plugin's `register()` raises `RuntimeError` because `Platform.KIMI` is missing. Use only for reviewing the hook PR diff.
+- `feat/kimi-plugin-variant`: the legacy fork branch that ships the plugin in-tree. Don't install this if you also intend to use the standalone plugin — you'd get two `plugins/kimi/` discovery entries.
+
+After both upstream PRs merge (registry hook + canonical Kimi wiring), install from PyPI:
 
 ```bash
-pip install 'hermes-agent @ git+https://github.com/linxule/hermes-agent.git@hook/platform-adapter-registry'
-```
-
-Note: the hook-only branch lacks `Platform.KIMI`, so this plugin's `register()` will raise `RuntimeError` with an actionable hint. Use it only for inspecting the upstream PR diff in isolation.
-
-After both upstream PRs merge:
-
-```bash
-pip install 'hermes-agent>=<version-with-hook-and-kimi-enum>'
+pip install 'hermes-agent>=<version-with-hook-and-kimi-wiring>'
 ```
 
 ### Install the plugin
@@ -103,15 +107,16 @@ If you don't see the `register_platform_adapter` line, the hook isn't present in
 
 Bloom (Xule's home Raspberry Pi) has been running this adapter against real Kimi traffic:
 - 2026-04-23 → 2026-04-26: in-tree at `gateway/platforms/kimi.py` on `linxule/hermes-agent:feat/kimi-platform-adapter`
-- 2026-04-26 → present: as this plugin on `linxule/hermes-agent:feat/kimi-plugin-variant`
+- 2026-04-26 → 2026-04-27: as this plugin in-tree on `linxule/hermes-agent:feat/kimi-plugin-variant`
+- 2026-04-27 → present: as this **standalone plugin** symlinked into `~/.hermes/plugins/kimi`, against `linxule/hermes-agent:feat/platform-kimi-enum` (the upstream-equivalent base for both prospective PRs)
 
-Validated end-to-end via gateway logs showing `hermes_plugins.kimi.kimi_adapter` as the connecting module (i.e., the plugin path, not the in-tree fallback shim).
+Validated end-to-end via gateway logs showing `hermes_plugins.kimi.kimi_adapter` as the connecting module (i.e., the plugin path from this repo, not any in-tree fallback shim).
 
 ## Tests
 
 ```bash
-# Install hermes-agent from the fork branch that has the registry hook + Platform.KIMI:
-pip install 'hermes-agent @ git+https://github.com/linxule/hermes-agent.git@feat/kimi-plugin-variant'
+# Install hermes-agent from the fork branch that has the registry hook + canonical Kimi wiring:
+pip install 'hermes-agent @ git+https://github.com/linxule/hermes-agent.git@feat/platform-kimi-enum'
 
 # Install plugin dev deps (pytest etc.) — the plugin itself is NOT pip-installed,
 # the wheel is intentionally metadata-only. The actual plugin discovery happens
