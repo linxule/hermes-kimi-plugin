@@ -1095,6 +1095,15 @@ class KimiAdapter(BasePlatformAdapter):
         self._startup_ts = time.time()
         self._http_session = aiohttp.ClientSession()
 
+        # Belt-and-braces sweep of parallel TTL state at the start of
+        # every connect cycle. Standard teardown paths (disconnect,
+        # cancel_background_tasks) already clear this, but partial-init
+        # failures or future code paths that bypass them could leave
+        # stale entries from a prior session — and the gateway reuses
+        # this same adapter instance on reconnect. Clearing here
+        # guarantees every connect starts from a known-empty state.
+        self._pending_enqueued_at.clear()
+
         # Fetch bot identity once — needed to filter self-authored group messages.
         try:
             me = await self._rpc_unary("GetMe", {})
@@ -1160,6 +1169,63 @@ class KimiAdapter(BasePlatformAdapter):
 
         await self._cleanup_http()
         self._release_platform_lock()
+
+        # Defense-in-depth: clear our parallel TTL state. The gateway's
+        # standard shutdown path calls cancel_background_tasks() before
+        # disconnect() (gateway/run.py:2725-2729), and that override
+        # already clears _pending_enqueued_at via super(). But other
+        # call sites — gateway/run.py:_safe_adapter_disconnect at
+        # ~line 953 + line 1145, plus the error-recovery branch at
+        # ~line 1110-1112 in connect() — call disconnect() directly
+        # without a prior drain. Clearing here ensures
+        # _pending_enqueued_at never outlives the connection,
+        # regardless of teardown path.
+        #
+        # Known limitation (out of scope for this fix): direct-
+        # disconnect paths don't clear the base class's
+        # ``_pending_messages`` or ``_active_sessions`` either — those
+        # only get cleaned up via cancel_background_tasks(). If a
+        # future code path reuses an adapter after a direct disconnect
+        # with real pending messages, those would also need clearing.
+        # The pre-existing behaviour is unchanged by this commit.
+        self._pending_enqueued_at.clear()
+
+    async def cancel_background_tasks(self) -> None:
+        """Mirror base behaviour for our parallel TTL state.
+
+        BasePlatformAdapter.cancel_background_tasks (gateway/platforms/
+        base.py:2553-2554) clears ``_pending_messages`` and
+        ``_active_sessions`` at the end of its drain. Our subclass
+        maintains a parallel ``_pending_enqueued_at`` dict that is
+        only meaningful while the corresponding ``_pending_messages``
+        slot is live; once base clears its state, our timestamps are
+        orphaned. Without this override they leak across reconnects
+        (the gateway typically reuses the adapter instance).
+
+        Correctness note: a stale-only timestamp is benign — the TTL
+        guard in ``handle_message`` keys off ``_pending_messages.get
+        (session_key)`` first (see line ~1247) and bails if no slot
+        exists, so a phantom ``_pending_enqueued_at`` entry can't
+        evict a real later message. The leak is a memory-hygiene
+        issue, not a correctness one — relevant for long-running pi
+        deployments that reconnect repeatedly over weeks.
+
+        Order: ``super()`` first, then our ``clear()``. Reversed,
+        an in-flight handler whose ``finally`` block runs during the
+        drain's ``await asyncio.gather`` could re-insert a key after
+        our clear, leaving us with a single stray entry per drain.
+        With this order, the base awaits all such handlers to
+        completion (their ``finally`` blocks see ``_pending_messages``
+        empty and pop their own timestamp via the guard), so our
+        clear is a final sweep over a known-empty dict.
+
+        Other parallel dicts on this adapter (``_last_message_id_per_
+        room`` for replay dedup, ``_probe_msg_id_room_counts`` for
+        debug counters) intentionally persist across reconnects or
+        carry no semantic state — they're not in scope here.
+        """
+        await super().cancel_background_tasks()
+        self._pending_enqueued_at.clear()
 
     async def _cleanup_http(self) -> None:
         if self._http_session is not None:
@@ -1247,13 +1313,32 @@ class KimiAdapter(BasePlatformAdapter):
             # with what super() puts in _pending_messages.
             self._pending_enqueued_at[session_key] = now
 
-        await super().handle_message(event)
-
-        # Clean up timestamp when the session finishes (slot consumed or
-        # not needed). Guard: only drop if the slot itself is gone, so a
-        # rapidly-arriving follow-up doesn't race-clear a fresh timestamp.
-        if session_key not in self._pending_messages:
-            self._pending_enqueued_at.pop(session_key, None)
+        try:
+            await super().handle_message(event)
+        finally:
+            # Clean up timestamp when the session finishes (slot consumed
+            # or not needed). Wrapped in finally so any unexpected
+            # exception from super() — most relevantly a CancelledError
+            # propagating up from base.handle_message itself — doesn't
+            # skip the cleanup and leak a timestamp into a future
+            # invocation. (Note: gateway/run.py's task-drain at
+            # cancel_background_tasks cancels ``_background_tasks`` —
+            # the spawned ``_process_message_background`` workers —
+            # not direct ``handle_message`` callers, so the
+            # cancellation pressure here is from other paths.)
+            #
+            # Why the guard is deterministic under cancellation: base
+            # writes to ``_pending_messages[session_key]`` happen
+            # synchronously with no ``await`` between the write and
+            # the function return (see gateway/platforms/base.py
+            # interrupt-queue path). So by the time our ``finally``
+            # observes ``_pending_messages``, the slot is in one of
+            # two known states: empty (no follow-up landed → safe to
+            # pop) or owned by a follow-up (write completed before
+            # our await unwound → preserve the fresh timestamp the
+            # follow-up's own pre-super block set).
+            if session_key not in self._pending_messages:
+                self._pending_enqueued_at.pop(session_key, None)
 
     # Public send / platform-surface overrides
     # ──────────────────────────────────────────────────────────────────────
