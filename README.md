@@ -101,6 +101,7 @@ If you don't see the `register_platform_adapter` line, the hook isn't present in
 | **Slash commands** | Pass-through to the Hermes runtime | `/new`, `/compact`, `/status`, etc. handled at the runtime layer. |
 | **Tool calls** | Native streaming via session/update | Tool-call frames are forwarded to the Kimi UI without being filtered. |
 | **Output modes** | `output_mode: tool_only \| passthrough` | `tool_only` suppresses agent text in favour of `SendMessage` tool calls (matches the hakimi pattern). Default is `passthrough`. See [Picking an output_mode](#picking-an-output_mode) below. |
+| **Bounded room state** | `_BoundedLRU(maxsize=N)` on `_rooms`, `_last_message_id_per_room`, `_probe_msg_id_room_counts` | Per-room dicts cap at `room_cache_max_entries` entries (default 500). Eviction does NOT affect message-dispatch correctness (replay-dedup is owned by `_processed_set`, separately bounded). It does have observable side effects under cardinality pressure — see [Bounded room state](#bounded-room-state) below. |
 | **Onboarding skill** | Embedded `optional-skills/communication/kimi-platform/` | Once enabled in skill settings, agents get a brief on Kimi-specific behaviours (group vs DM, slash semantics, etc.). |
 
 ### Picking an `output_mode`
@@ -127,6 +128,27 @@ When to stay on `passthrough`:
 - **Setups where the agent isn't reliably guided** (system prompt or skill nudge) to call `send_message_tool`. Without that guidance, `tool_only` makes the bot appear mute on every turn.
 
 This flag exists because the bridge's previous workaround (`HIDE_TOOL_CALLS=1`) hung Hermes over stdio. The adapter's in-process coupling lets the suppression happen at the right layer without that deadlock.
+
+### Bounded room state
+
+Three of the adapter's per-room dicts (`_rooms`, `_last_message_id_per_room`, `_probe_msg_id_room_counts`) used to grow without ceiling on long-running deployments. They're now backed by `_BoundedLRU` with a configurable cap (`room_cache_max_entries`, default 500). The cap is **per-dict**, but all three share the same `room_id` key space so cardinality is symmetric.
+
+**What eviction never breaks:** message-dispatch correctness. Replay dedup is owned by `_processed_set`, which is bounded by `_DEDUP_MAXLEN=2000` independently. Whether a room's metadata is in `_rooms` or not has zero bearing on whether the agent sees a duplicate or dropped message.
+
+**What eviction *does* affect** under cardinality pressure (≥ cap rooms ever encountered):
+
+1. **`first-seen` DEBUG log on resumed rooms.** `_last_message_id_per_room` is hoisted out of the DEBUG gate so toggling DEBUG on later doesn't produce a misleading `first-seen`. Eviction reintroduces a narrower version of that artifact: a quiet room evicted then resumed will log `first-seen` instead of a delta on its first message back. Misleading observability, not misleading state.
+2. **Probe sample-phase reset.** `_probe_msg_id_room_counts` keys its DEBUG sampling phase off the count modulo `probe_msg_id_sample_rate`. After eviction the count restarts at 1, so the first `sample_rate - 1` resumed messages are skipped from the DEBUG sample.
+3. **Cold-resume RPC failure.** `_rooms` re-fetches a missing entry via `GetRoom` + `ListMembers`; on transient `KimiAdapterError` the fallback returns `{"name": room_id, "type": "group"}` with no members. Without eviction, that fallback only runs for *never-cached* rooms; with eviction, a failed re-fetch on a previously-cached room can briefly degrade display name + members until the next successful refresh.
+
+For Bloom's typical Pi deployment (~10 unique rooms over weeks) none of these ever fire. For deployments with hundreds-to-thousands of rooms, raise the cap:
+
+```yaml
+platforms:
+  kimi:
+    extra:
+      room_cache_max_entries: 5000
+```
 
 ## Production reference
 

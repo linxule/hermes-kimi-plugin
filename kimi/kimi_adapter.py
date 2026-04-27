@@ -41,7 +41,7 @@ import re
 import struct
 import time
 import uuid
-from collections import deque
+from collections import OrderedDict, deque
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, AsyncIterator, Dict, List, Optional, Set, Tuple
@@ -155,6 +155,15 @@ _DM_HEALTH_SUMMARY_S_DEFAULT = 3600.0
 
 # Dedup ring buffer size — covers Kimi's replay window on Subscribe reconnect.
 _DEDUP_MAXLEN = 2000
+
+# Default cap for per-room state dicts (``_rooms``, ``_last_message_id_per_
+# room``, ``_probe_msg_id_room_counts``). Bloom in production sees ~4-10 unique
+# rooms over weeks; 500 is two orders of magnitude above that, so the cap is
+# inert for normal operation. The point is to bound the worst case for
+# operators running this plugin at higher cardinality (Bloom-as-a-Service,
+# multi-org deployments) without forcing them to tune anything. Override via
+# ``config.extra["room_cache_max_entries"]``.
+_ROOM_CACHE_DEFAULT_MAX = 500
 
 # Kimi file upload/download tuning.
 _FILE_UPLOAD_MAX_PATHS = 5
@@ -818,6 +827,88 @@ class _ChatInfoCache:
     last_refresh_ts: float = 0.0
 
 
+class _BoundedLRU(OrderedDict):
+    """``OrderedDict`` with a hard size cap; oldest entry evicted on overflow.
+
+    Used for the adapter's per-room state dicts (``_rooms``,
+    ``_last_message_id_per_room``, ``_probe_msg_id_room_counts``) so the
+    plugin stays bounded under arbitrary room cardinality. Reads do **not**
+    refresh order — only writes. "Least recently used" → "least recently
+    *updated*", which is the right semantics for our consumers:
+
+    - ``_last_message_id_per_room`` is written every inbound group message,
+      so a busy room naturally refreshes its position; idle rooms drift
+      toward the LRU end. If reads refreshed too, the cap could never
+      bite a single chatty room (read every message + write every message
+      → permanent residency for *any* room with traffic).
+    - ``_rooms`` owns its own freshness via the 300s TTL re-fetch in
+      ``get_chat_info``; eviction recency is decoupled from that on
+      purpose. Update-LRU treats "least recently re-fetched" as the
+      eviction key, which is exactly what we want for a TTL-managed cache.
+    - ``_probe_msg_id_room_counts`` reads and writes at the same call site
+      (increment-then-store), so the read/write distinction is irrelevant.
+
+    None of these dicts hold *message-dispatch* correctness state — replay
+    dedup is owned by ``_processed_set``, which is independently bounded by
+    ``_DEDUP_MAXLEN``. So eviction never causes a duplicate or dropped
+    message at the agent layer.
+
+    Eviction *does* have observable side effects under cardinality pressure
+    that we accept as the cost of bounded growth:
+
+    1. **Resumed-room ``first-seen`` DEBUG log.** ``_last_message_id_per_
+       room`` is hoisted out of the DEBUG gate (line ~2412) specifically
+       so toggling DEBUG on later doesn't produce a misleading
+       ``first-seen`` for an active room. Eviction of a quiet room
+       reintroduces a similar (but narrower) failure mode: the next
+       message from a resumed-after-eviction room logs ``first-seen``
+       instead of a delta. Misleading observability, not misleading
+       state. At the default cap (500) and Bloom's typical cardinality
+       (~10 rooms) this never fires.
+    2. **Probe sample-phase reset.** ``_probe_msg_id_room_counts`` keys
+       its sampling phase off the count modulo ``probe_msg_id_sample_
+       rate``. Eviction resets to count=1 so the first ``sample_rate-1``
+       resumed messages are skipped from the DEBUG sample. Same scale
+       gating as #1.
+    3. **``_rooms`` cold-resume + RPC failure.** ``get_chat_info`` re-
+       fetches a missing entry via ``GetRoom``/``ListMembers``; on
+       ``KimiAdapterError`` the fallback path returns
+       ``{"name": room_id, "type": "group"}`` with no members. Without
+       eviction, that fallback only runs for never-cached rooms; with
+       eviction, a transient RPC failure on a previously-cached room
+       can briefly degrade display name + members until the next
+       successful refresh. Real degradation, but bounded to one
+       inbound per failed re-fetch and recovered on next success.
+
+    None of these triggers at the default cap unless room cardinality
+    exceeds 500, and operators can raise ``room_cache_max_entries`` if
+    they routinely run more rooms than that. The README's "Bounded room
+    state" entry summarises this for users.
+    """
+
+    def __init__(self, *, maxsize: int):
+        super().__init__()
+        if maxsize < 1:
+            raise ValueError(f"maxsize must be ≥ 1, got {maxsize!r}")
+        self._maxsize = maxsize
+
+    def __setitem__(self, key: Any, value: Any) -> None:
+        # Update existing key in-place but move it to the most-recent end so
+        # the LRU ordering reflects the latest activity — important for
+        # ``_last_message_id_per_room``, which writes the same key on every
+        # inbound message in a busy room and must NOT count that room as
+        # stale just because it was first inserted long ago.
+        if key in self:
+            self.move_to_end(key, last=True)
+            super().__setitem__(key, value)
+            return
+        super().__setitem__(key, value)
+        # Evict from the oldest end until we're under cap. ``last=False``
+        # pops the *first*-inserted key (FIFO from the LRU end).
+        while len(self) > self._maxsize:
+            self.popitem(last=False)
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Adapter
 # ──────────────────────────────────────────────────────────────────────────────
@@ -1016,13 +1107,30 @@ class KimiAdapter(BasePlatformAdapter):
         self._processed: deque = deque(maxlen=_DEDUP_MAXLEN)
         self._processed_set: Set[Tuple[str, str]] = set()
 
+        # Bound the per-room state dicts so cardinality can't grow without
+        # ceiling on long-running deployments (see ``_ROOM_CACHE_DEFAULT_MAX``
+        # for rationale). All three dicts share the same key space (room_id)
+        # and the same eviction semantics, so a single cap is sufficient.
+        _raw_room_cap = config.extra.get(
+            "room_cache_max_entries", _ROOM_CACHE_DEFAULT_MAX
+        )
+        try:
+            _room_cap = max(1, int(_raw_room_cap))
+        except (TypeError, ValueError):
+            logger.warning(
+                "Kimi: invalid room_cache_max_entries=%r in config.extra — "
+                "expected positive integer, falling back to %d",
+                _raw_room_cap, _ROOM_CACHE_DEFAULT_MAX,
+            )
+            _room_cap = _ROOM_CACHE_DEFAULT_MAX
+
         # Per-room cache
-        self._rooms: Dict[str, _ChatInfoCache] = {}
+        self._rooms: _BoundedLRU = _BoundedLRU(maxsize=_room_cap)
 
         # Probe (H-C): per-room last-seen message_id, for DEBUG timing
         # correlation against conductor wall-clock. Observability only —
         # removable standalone with the Probe-3 log block.
-        self._last_message_id_per_room: Dict[str, str] = {}
+        self._last_message_id_per_room: _BoundedLRU = _BoundedLRU(maxsize=_room_cap)
         # Probe (H-C) sample-rate knob: log 1-in-N per-room DEBUG records
         # under busy groups so operators can cap log volume without flipping
         # DEBUG off entirely. Default 1 (log every message — prior behavior).
@@ -1038,7 +1146,7 @@ class KimiAdapter(BasePlatformAdapter):
                 _raw_sample_rate,
             )
             self._probe_msg_id_sample_rate = 1
-        self._probe_msg_id_room_counts: Dict[str, int] = {}
+        self._probe_msg_id_room_counts: _BoundedLRU = _BoundedLRU(maxsize=_room_cap)
 
         # ── Lift 3a: interrupt-and-drain queue improvements ───────────────
         # Pending-slot TTL (seconds). ``None`` = never expire (default,

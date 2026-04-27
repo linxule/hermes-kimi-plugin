@@ -23,12 +23,14 @@ from kimi_adapter import (
     _CONNECT_FLAG_COMPRESSED,
     _CONNECT_FLAG_END_STREAM,
     _DMInflight,
+    _ROOM_CACHE_DEFAULT_MAX,
     _WS_MAX_FRAME_SIZE,
     KimiAdapter,
     KimiAuthError,
     KimiProtocolError,
     KimiRpcError,
     KimiTransientError,
+    _BoundedLRU,
     _extract_blocks_payload,
     _extract_short_id_from_text,
     _extract_user_identity,
@@ -3287,6 +3289,148 @@ class PendingEnqueuedAtCleanupTests(unittest.IsolatedAsyncioTestCase):
             "try/finally should pop the timestamp on CancelledError when the "
             "pending slot was never populated",
         )
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Issue #22: room-state eviction policy (bounded LRU on per-room dicts)
+#
+# The adapter has three dicts keyed on room_id that grew without ceiling on
+# long-running deployments: ``_rooms`` (cache), ``_last_message_id_per_room``
+# (DEBUG observability anchor), ``_probe_msg_id_room_counts`` (DEBUG counter).
+# All three are now backed by ``_BoundedLRU`` with a configurable cap. None of
+# them hold replay-dedup correctness state — that's ``_processed_set``, which
+# is bounded by ``_DEDUP_MAXLEN`` independently. Eviction is silent because
+# every consumer of these dicts handles a missing entry transparently
+# (re-fetch / first-seen path).
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class BoundedLRUTests(unittest.TestCase):
+    """Stand-alone behaviour of the _BoundedLRU primitive."""
+
+    def test_grows_up_to_cap(self):
+        """Inserts up to ``maxsize`` are kept; nothing evicted yet."""
+        d = _BoundedLRU(maxsize=3)
+        for i in range(3):
+            d[f"k{i}"] = i
+        self.assertEqual(len(d), 3)
+        self.assertEqual(list(d.keys()), ["k0", "k1", "k2"])
+
+    def test_evicts_oldest_when_over_cap(self):
+        """N+1th insert pops the first-inserted key (FIFO from LRU end)."""
+        d = _BoundedLRU(maxsize=3)
+        d["a"] = 1
+        d["b"] = 2
+        d["c"] = 3
+        d["d"] = 4  # cap exceeded → evict "a"
+        self.assertEqual(len(d), 3)
+        self.assertNotIn("a", d)
+        self.assertEqual(list(d.keys()), ["b", "c", "d"])
+
+    def test_update_moves_key_to_recent_end(self):
+        """Re-writing an existing key refreshes its LRU position so it's
+        not next to be evicted. This is what protects ``_last_message_id_
+        per_room`` for a busy room from being evicted just because the
+        room was first inserted long ago."""
+        d = _BoundedLRU(maxsize=3)
+        d["a"] = 1
+        d["b"] = 2
+        d["c"] = 3
+        d["a"] = 99  # touch "a" — it should now be the freshest
+        d["d"] = 4   # cap exceeded → evict "b" (oldest), NOT "a"
+        self.assertEqual(d["a"], 99)
+        self.assertNotIn("b", d)
+        self.assertEqual(list(d.keys()), ["c", "a", "d"])
+
+    def test_get_does_not_refresh_lru(self):
+        """Reads must not move the key to the recent end. We want
+        'least recently *updated*' semantics, not 'least recently
+        accessed' — for ``_last_message_id_per_room`` the read happens
+        every inbound message, so refreshing on read would defeat the
+        cap entirely."""
+        d = _BoundedLRU(maxsize=3)
+        d["a"] = 1
+        d["b"] = 2
+        d["c"] = 3
+        _ = d.get("a")     # read — must NOT touch ordering
+        _ = d["a"]         # subscript read — must NOT touch ordering
+        d["e"] = 5         # cap exceeded → evict "a" (still oldest)
+        self.assertNotIn("a", d)
+        self.assertEqual(list(d.keys()), ["b", "c", "e"])
+
+    def test_invalid_maxsize_rejected(self):
+        """Cap of 0 or negative is a config bug, not a runtime no-op."""
+        with self.assertRaises(ValueError):
+            _BoundedLRU(maxsize=0)
+        with self.assertRaises(ValueError):
+            _BoundedLRU(maxsize=-1)
+
+
+class RoomCacheCapIntegrationTests(unittest.TestCase):
+    """Adapter-level: per-room dicts honour the cap, config knob plumbed."""
+
+    def test_default_cap_applied(self):
+        """No config override → all three dicts use _ROOM_CACHE_DEFAULT_MAX."""
+        adapter = KimiAdapter(_cfg())
+        self.assertIsInstance(adapter._rooms, _BoundedLRU)
+        self.assertIsInstance(adapter._last_message_id_per_room, _BoundedLRU)
+        self.assertIsInstance(adapter._probe_msg_id_room_counts, _BoundedLRU)
+        self.assertEqual(adapter._rooms._maxsize, _ROOM_CACHE_DEFAULT_MAX)
+        self.assertEqual(
+            adapter._last_message_id_per_room._maxsize, _ROOM_CACHE_DEFAULT_MAX
+        )
+        self.assertEqual(
+            adapter._probe_msg_id_room_counts._maxsize, _ROOM_CACHE_DEFAULT_MAX
+        )
+
+    def test_config_override_applied(self):
+        """``room_cache_max_entries`` in config.extra propagates to all three."""
+        adapter = KimiAdapter(_cfg(room_cache_max_entries=10))
+        self.assertEqual(adapter._rooms._maxsize, 10)
+        self.assertEqual(adapter._last_message_id_per_room._maxsize, 10)
+        self.assertEqual(adapter._probe_msg_id_room_counts._maxsize, 10)
+
+    def test_invalid_config_falls_back_to_default(self):
+        """Garbage in config doesn't crash startup; default applies + warning."""
+        adapter = KimiAdapter(_cfg(room_cache_max_entries="not-an-int"))
+        self.assertEqual(adapter._rooms._maxsize, _ROOM_CACHE_DEFAULT_MAX)
+
+    def test_negative_or_zero_clamped_to_one(self):
+        """``max(1, int(...))`` floors any non-positive value at 1, matching
+        the same defensive pattern used by ``probe_msg_id_sample_rate``."""
+        adapter = KimiAdapter(_cfg(room_cache_max_entries=0))
+        self.assertEqual(adapter._rooms._maxsize, 1)
+        adapter2 = KimiAdapter(_cfg(room_cache_max_entries=-5))
+        self.assertEqual(adapter2._rooms._maxsize, 1)
+
+    def test_per_room_dict_evicts_under_pressure(self):
+        """Insert past the cap; oldest room_id is dropped silently."""
+        adapter = KimiAdapter(_cfg(room_cache_max_entries=3))
+        adapter._last_message_id_per_room["room-1"] = "msg-1"
+        adapter._last_message_id_per_room["room-2"] = "msg-2"
+        adapter._last_message_id_per_room["room-3"] = "msg-3"
+        adapter._last_message_id_per_room["room-4"] = "msg-4"  # evicts room-1
+        self.assertEqual(len(adapter._last_message_id_per_room), 3)
+        self.assertNotIn("room-1", adapter._last_message_id_per_room)
+        self.assertEqual(adapter._last_message_id_per_room["room-4"], "msg-4")
+
+    def test_busy_room_protected_from_eviction(self):
+        """A room receiving frequent updates moves to the recent end on each
+        write and is NOT evicted just because it was first inserted long ago.
+        This is the load-bearing case for ``_last_message_id_per_room`` —
+        a single chatty room should be the LAST to evict, not the first."""
+        adapter = KimiAdapter(_cfg(room_cache_max_entries=3))
+        # Insert busy + idle rooms.
+        adapter._last_message_id_per_room["busy"] = "msg-1"
+        adapter._last_message_id_per_room["idle-a"] = "msg-2"
+        adapter._last_message_id_per_room["idle-b"] = "msg-3"
+        # 100 more messages in "busy" — each write refreshes its LRU position.
+        for i in range(100):
+            adapter._last_message_id_per_room["busy"] = f"msg-{10+i}"
+        # Now insert a 4th distinct room. Eviction should hit "idle-a"
+        # (oldest among rooms that haven't been touched), NOT "busy".
+        adapter._last_message_id_per_room["new-room"] = "msg-fresh"
+        self.assertIn("busy", adapter._last_message_id_per_room)
+        self.assertNotIn("idle-a", adapter._last_message_id_per_room)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
