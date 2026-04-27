@@ -441,12 +441,20 @@ _ULID_CROCKFORD_INDEX = {c: i for i, c in enumerate(_ULID_CROCKFORD)}
 def _ulid_time_ms(ulid_str: Optional[str]) -> Optional[int]:
     """Extract the 48-bit Crockford-base32 timestamp prefix from a ULID.
 
-    Kimi message_ids follow the ULID format (first 10 chars = ms timestamp
-    in Crockford base32). Returns None if the input doesn't look like a
-    valid ULID prefix. Case-insensitive.
+    Returns None on malformed input. **Important production caveat:** Kimi's
+    actual message ids in production are UUID v6/v7/v8-shaped (36-char dashed
+    hex like ``19dc9c4f-1262-8c1b-8000-0a4a6c626bbb``), not Crockford base32
+    ULIDs. The first 48 bits of those UUIDs ARE time-monotonic but their
+    units are NOT unix-ms — captured deltas show ~16× the wall-clock seconds,
+    suggesting a Snowflake-style or otherwise non-standard epoch encoding.
 
-    Used only by the Probe-3 message_id timing DEBUG log — observability
-    only, no behavioral role.
+    For correctness, this decoder accepts only the canonical Crockford ULID
+    format. Production gap-detection should NOT rely on this — use wall-
+    clock ``time.time()`` arrival tracking instead (see
+    ``_last_arrival_time_per_room`` and the Phase 0 #18 gap-candidate logger).
+
+    Used by Probe-3 timing DEBUG log and the test suite. Returns None for
+    UUID-shaped input so callers must fall back to a different time source.
     """
     if not ulid_str or not isinstance(ulid_str, str) or len(ulid_str) < 10:
         return None
@@ -1041,6 +1049,19 @@ class KimiAdapter(BasePlatformAdapter):
         self._group_subscribe_backoff_floor: float = 10.0
         self._group_subscribe_backoff: float = self._group_subscribe_backoff_base
         self._group_subscribe_frame_since_connect: bool = False
+        # Monotonic counter of successful subscribe-stream reconnects,
+        # incremented at the first chatMessage post-connect. Phase 0 burst-
+        # drop instrumentation: operators correlate this against per-room
+        # gap-candidate INFOs in the same log to see whether drops cluster
+        # around reconnects (favours Phase 1 design) or appear mid-stream
+        # (favours Phase 2/3). Cold start counts as #1.
+        self._group_subscribe_reconnect_count: int = 0
+        # Wall-clock timestamp (``time.time()``) of the most recent
+        # increment, captured at the same line. Used by the gap-candidate
+        # INFO log to compute ``since_reconnect_s`` so the correlation
+        # operators want is in a single line rather than across two
+        # journalctl streams. ``-1`` sentinel = no reconnect observed yet.
+        self._group_subscribe_last_reconnect_ts: float = -1.0
         self._ws_ping_interval: int = int(config.extra.get("ws_ping_interval", 15))
         self._ws_ping_timeout: int = int(config.extra.get("ws_ping_timeout", 60))
         self._dm_app_keepalive_s: float = float(
@@ -1147,6 +1168,37 @@ class KimiAdapter(BasePlatformAdapter):
             )
             self._probe_msg_id_sample_rate = 1
         self._probe_msg_id_room_counts: _BoundedLRU = _BoundedLRU(maxsize=_room_cap)
+
+        # Phase 0 burst-drop instrumentation: per-room wall-clock arrival
+        # tracking + INFO threshold. Tracks ``time.time()`` at the moment
+        # each chatMessage is processed in ``_on_group_event``; logs at INFO
+        # when the per-room delta meets the threshold. Wall-clock (not
+        # monotonic) because operators correlate against ISO timestamps in
+        # journalctl, not against process-uptime. Same key space + cap as
+        # the other per-room dicts (see ``_BoundedLRU`` discussion above).
+        self._last_arrival_time_per_room: _BoundedLRU = _BoundedLRU(maxsize=_room_cap)
+
+        # Threshold in seconds for emitting the gap-candidate INFO log. 0
+        # disables. Default 30 — well above conversational cadence (humans
+        # often reply within 1-5s), conservative enough that an idle room
+        # resuming after a coffee break naturally crosses it. False-positive
+        # rate is acceptable: the operator-facing premise is "look for
+        # CLUSTERS of these correlating against reconnects", not "any single
+        # one is a problem". Codex review #1 noted this risks flooding INFO
+        # in idle rooms — the wall-clock pivot keeps the signal honest;
+        # threshold tuning per-deployment is the operator's call.
+        _raw_gap_threshold = config.extra.get(
+            "burst_drop_gap_log_threshold_s", 30.0
+        )
+        try:
+            self._burst_drop_gap_log_threshold_s: float = max(0.0, float(_raw_gap_threshold))
+        except (TypeError, ValueError):
+            logger.warning(
+                "Kimi: invalid burst_drop_gap_log_threshold_s=%r in config.extra "
+                "— expected non-negative number, falling back to 30.0",
+                _raw_gap_threshold,
+            )
+            self._burst_drop_gap_log_threshold_s = 30.0
 
         # ── Lift 3a: interrupt-and-drain queue improvements ───────────────
         # Pending-slot TTL (seconds). ``None`` = never expire (default,
@@ -1638,23 +1690,109 @@ class KimiAdapter(BasePlatformAdapter):
         include_start_message: bool = True,
         include_end_message: bool = True,
         direction: str = "BACKWARD",
+        max_pages: int = 1,
     ) -> List[Dict[str, Any]]:
-        """Return recent Kimi IM message wrappers for a group or thread chat."""
-        body: Dict[str, Any] = {
-            "chatId": chat_id,
-            "pageSize": limit,
-            "direction": direction,
-            "includeStartMessage": include_start_message,
-            "includeEndMessage": include_end_message,
-            "pageToken": "",
-        }
-        if start_message_id:
-            body["startMessageId"] = start_message_id
-        if end_message_id:
-            body["endMessageId"] = end_message_id
-        resp = await self._rpc_unary("ListMessages", body)
-        messages = resp.get("messages")
-        return [m for m in messages if isinstance(m, dict)] if isinstance(messages, list) else []
+        """Return Kimi IM message wrappers for a group or thread chat.
+
+        Wraps ``kimi.gateway.im.v1.IMService.ListMessages`` (unary
+        Connect-RPC at ``https://www.kimi.com/api-ws/``).
+
+        ## Direction (anchor-relative)
+
+        - ``BACKWARD`` (default, wire enum value 2) — returns messages going
+          *older in time* from the anchor. With no ``startMessageId``, returns
+          the latest ``limit`` messages newest-first. With ``startMessageId``,
+          returns messages older than (or including, per
+          ``includeStartMessage``) that id. This is the "show me history" mode.
+          ``_fetch_group_message`` (below) relies on this.
+        - ``FORWARD`` — returns messages going *newer in time* from the
+          anchor (and including the anchor when ``includeStartMessage=True``).
+          Use this for catch-up / recovery patterns: pass the last message id
+          you saw to fetch what came after. **Probed live 2026-04-27** via
+          kimiim-cli: anchor of an oldest known id returned newer messages
+          (CreateTimes ascending forward in time) plus the anchor itself in
+          newest-first display order.
+
+        ## Pagination (max_pages)
+
+        The response carries ``nextPageToken``; echo it back as ``pageToken``
+        on the next request. Empty/missing token = end of stream. Tokens are
+        opaque server-issued cursors (NOT message ids — kimiim-cli treats
+        ``--start-id`` and ``--page-token`` as separate modes).
+
+        ``max_pages`` (default 1) caps the loop. Default keeps backward-
+        compatible single-page behaviour with every existing caller. Set
+        higher to recover gaps larger than ``limit`` messages; the cap
+        prevents runaway fetches if Kimi keeps issuing tokens.
+
+        Mirrors ``list_group_files`` (below) and ``list_group_members`` —
+        same ``pageToken`` round-trip pattern.
+
+        ## Wrapper schema (per item in returned list)
+
+        ::
+
+            {
+                "senderId": str,
+                "senderShortId": str,           # optional
+                "senderName": str,              # optional
+                "messageId": str,               # OPTIONAL at top level
+                "message": {                    # canonical Message object
+                    "id": str,                  # canonical message id lives HERE
+                    "blocks": [...],
+                    "threadId": str,            # optional
+                    ...
+                },
+            }
+
+        **Top-level ``messageId`` is sometimes absent** — the canonical id is
+        ``wrapper["message"]["id"]``. Use ``_field`` to walk both possibilities
+        safely (see ``_fetch_group_message`` for the precedent).
+
+        ## Edge cases
+
+        - Unknown ``chatId``: HTTP 400 → ``KimiRpcError``.
+        - Malformed/zero ``startMessageId``: HTTP 400 with body
+          ``"value does not match any of the specified id_kinds"`` (Kimi
+          validates against ``id_kind=uuidv8`` — confirms the production id
+          format). Treat as permanent error.
+        - Stale-but-shape-valid ``startMessageId``: behaviour unproven for
+          actual deleted/non-existent ids; recommend wrapping recovery calls
+          in ``try/except KimiRpcError`` and falling back to no-anchor.
+        - Empty room: returns ``[]`` after one RPC call.
+
+        Sources for the contract:
+        - kimiim-cli ``list-messages -h`` (definitive, since kimiim-cli is
+          Kimi's own binary for this RPC)
+        - mitm-captured request body for direction default
+        - existing wrapper consumers ``_fetch_group_message`` and the
+          hydration tests
+        """
+        if max_pages < 1:
+            raise ValueError(f"max_pages must be ≥ 1, got {max_pages!r}")
+        wrappers: List[Dict[str, Any]] = []
+        page_token = ""
+        for _ in range(max_pages):
+            body: Dict[str, Any] = {
+                "chatId": chat_id,
+                "pageSize": limit,
+                "direction": direction,
+                "includeStartMessage": include_start_message,
+                "includeEndMessage": include_end_message,
+                "pageToken": page_token,
+            }
+            if start_message_id:
+                body["startMessageId"] = start_message_id
+            if end_message_id:
+                body["endMessageId"] = end_message_id
+            resp = await self._rpc_unary("ListMessages", body)
+            messages = resp.get("messages")
+            if isinstance(messages, list):
+                wrappers.extend(m for m in messages if isinstance(m, dict))
+            page_token = str(resp.get("nextPageToken") or "")
+            if not page_token:
+                break
+        return wrappers
 
     async def list_group_files(
         self,
@@ -2330,6 +2468,26 @@ class KimiAdapter(BasePlatformAdapter):
                         if is_chat_message and not self._group_subscribe_frame_since_connect:
                             self._group_subscribe_frame_since_connect = True
                             prev_backoff = self._group_subscribe_backoff
+                            self._group_subscribe_reconnect_count += 1
+                            self._group_subscribe_last_reconnect_ts = time.time()
+                            # Phase 0 burst-drop instrumentation: snapshot the
+                            # adapter's per-room state at the first chatMessage
+                            # post-connect. This is the candidate "Phase 1
+                            # recovery hook point" — operators reading
+                            # journalctl can correlate gap-candidate INFOs
+                            # against this line to see whether suspicious gaps
+                            # cluster around reconnects (favouring Phase 1
+                            # recovery design) or appear mid-stream (favouring
+                            # Phase 2 / 3). The counter is monotonic over the
+                            # adapter lifetime; a sudden cluster of increments
+                            # is itself signal.
+                            logger.info(
+                                "Kimi groups: subscribe stream live "
+                                "(connect#%d, rooms_tracked=%d, prev_backoff=%.1fs)",
+                                self._group_subscribe_reconnect_count,
+                                len(self._last_message_id_per_room),
+                                prev_backoff,
+                            )
                             # Conditional reset: only clamp to the floor when
                             # backoff actually grew beyond it. Cold start
                             # (backoff=base=2s) stays at 2s with no spurious
@@ -2452,6 +2610,52 @@ class KimiAdapter(BasePlatformAdapter):
         this_id_str = str(message_id)
         prev_id = self._last_message_id_per_room.get(room_key)
         self._last_message_id_per_room[room_key] = this_id_str
+
+        # Phase 0 burst-drop instrumentation: track wall-clock ARRIVAL time
+        # per room, not the ULID-embedded timestamp. Two reasons: (1) Kimi's
+        # production message ids are UUID v8 with a non-standard epoch (their
+        # first 48 bits aren't unix-ms — captured deltas show ~16× the
+        # wall-clock interval). (2) Even if the encoding were unix-ms, gap-
+        # candidate signal is fundamentally about "how long did the adapter
+        # wait between successive deliveries?" — wall-clock at receive time
+        # answers that directly, without depending on Kimi's id format.
+        # ``time.time()`` is wall-clock seconds (not monotonic) but adequate
+        # here: monotonic time has no human meaning for journalctl correlation,
+        # and clock-skew during a single python process runtime is bounded.
+        now_wall_s = time.time()
+        prev_arrival = self._last_arrival_time_per_room.get(room_key)
+        self._last_arrival_time_per_room[room_key] = now_wall_s
+
+        wall_delta_s: Optional[float] = None
+        if prev_arrival is not None:
+            wall_delta_s = now_wall_s - prev_arrival
+            if (
+                self._burst_drop_gap_log_threshold_s > 0
+                and wall_delta_s >= self._burst_drop_gap_log_threshold_s
+            ):
+                # Include since-last-reconnect so operators can correlate gap
+                # candidates against reconnect events without grepping two
+                # log streams. -1 means "no reconnect observed yet this
+                # process" (cold start before first chatMessage).
+                if self._group_subscribe_last_reconnect_ts > 0:
+                    since_reconnect_s = now_wall_s - self._group_subscribe_last_reconnect_ts
+                    correlation = f"since_reconnect_s={since_reconnect_s:.1f}"
+                else:
+                    correlation = "since_reconnect_s=N/A"
+                logger.info(
+                    "Kimi groups: gap candidate room=%s id=%s prev=%s "
+                    "delta_s=%.1f (>=%.1fs threshold) %s connect#=%d",
+                    chat_id, message_id, prev_id, wall_delta_s,
+                    self._burst_drop_gap_log_threshold_s,
+                    correlation,
+                    self._group_subscribe_reconnect_count,
+                )
+
+        # Probe-3 DEBUG path uses ULID-decoded magnitudes for backward
+        # compatibility with the existing test fixtures. In production these
+        # consistently return None because Kimi sends UUIDs, so the DEBUG
+        # log path falls through to "first-seen" — that's expected and
+        # not the gap-candidate signal anyway.
         if logger.isEnabledFor(logging.DEBUG):
             # Sample-rate gate: only count + conditionally emit inside DEBUG,
             # so INFO and above pay nothing for the per-room counter dict
@@ -2462,10 +2666,10 @@ class KimiAdapter(BasePlatformAdapter):
                 this_ts = _ulid_time_ms(this_id_str)
                 prev_ts = _ulid_time_ms(prev_id) if prev_id else None
                 if this_ts is not None and prev_ts is not None:
-                    delta_ms = this_ts - prev_ts
+                    legacy_delta_ms = this_ts - prev_ts
                     logger.debug(
                         "Kimi groups: message_id timing room=%s id=%s prev=%s delta_ms=%d",
-                        chat_id, message_id, prev_id, delta_ms,
+                        chat_id, message_id, prev_id, legacy_delta_ms,
                     )
                 else:
                     logger.debug(

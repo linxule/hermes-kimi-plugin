@@ -2835,12 +2835,28 @@ class Probe3MessageIdTimingTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(_ulid_time_ms(""))
         self.assertIsNone(_ulid_time_ms("01ARZ3NDE"))  # 9 chars, too short
         # 'I', 'L', 'O', 'U' are NOT in Crockford base32 — must reject.
+        # (These IDs are 10 chars so they don't trip the UUID branch.)
         self.assertIsNone(_ulid_time_ms("01IRZ3NDEK"))
         self.assertIsNone(_ulid_time_ms("01LRZ3NDEK"))
         self.assertIsNone(_ulid_time_ms("01ORZ3NDEK"))
         self.assertIsNone(_ulid_time_ms("01URZ3NDEK"))
         # Non-string input.
         self.assertIsNone(_ulid_time_ms(12345))  # type: ignore[arg-type]
+
+    def test_ulid_time_ms_returns_none_for_uuid_v8_production_format(self):
+        """Real Kimi message ids are UUID v8 (per Kimi's own error message:
+        ``id_kind=uuidv8``). Their first 48 bits are NOT unix-ms — captured
+        deltas show ~16× wall-clock seconds, suggesting a non-standard epoch
+        encoding. ``_ulid_time_ms`` deliberately does NOT decode UUID format
+        because the resulting magnitudes can't be interpreted as
+        milliseconds. Production gap-detection uses wall-clock
+        ``time.time()`` arrival tracking instead — see
+        ``_last_arrival_time_per_room`` and the Phase 0 #18 gap-candidate
+        logger. This test guards against a future "fix" that re-introduces
+        UUID decoding without addressing the unit mismatch.
+        """
+        self.assertIsNone(_ulid_time_ms("19dc9c4f-1262-8c1b-8000-0a4a6c626bbb"))
+        self.assertIsNone(_ulid_time_ms("19dc9c4d-93c2-87b8-8000-0a4a0ecd76fe"))
 
     async def test_message_id_probe_tracker_populates_at_info_level(self):
         """Fix A / Fix E invariant: tracker-update is hoisted out of the
@@ -3013,6 +3029,264 @@ def _compute_session_key(adapter: "KimiAdapter", event: "MagicMock") -> str:
         group_sessions_per_user=adapter._group_sessions_per_user,
         thread_sessions_per_user=adapter._thread_sessions_per_user,
     )
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Issue #18 Phase 0 instrumentation: gap-candidate INFO + reconnect counter +
+# ListMessages pagination.
+#
+# This is the EVIDENCE-GATHERING layer for the future burst-drop recovery work
+# (Phase 1+). It does not recover anything; it only surfaces signal that
+# operators can use to validate which design wins. Three independent pieces:
+#
+#   1. ``BurstDropGapLogTests`` — promote suspiciously-large per-room
+#      message_id timestamp deltas to INFO so they show up in journalctl
+#      regardless of DEBUG state.
+#   2. ``GroupSubscribeReconnectCounterTests`` — counter + snapshot log on
+#      the first chatMessage post-connect, the candidate Phase 1 hook point.
+#   3. ``ListGroupMessagesPaginationTests`` — wrapper now follows
+#      ``nextPageToken`` up to ``max_pages``. Required for any recovery
+#      design that fetches more than ``limit`` messages from a gap.
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class BurstDropGapLogTests(unittest.IsolatedAsyncioTestCase):
+    """Phase 0 (#18): suspicious wall-clock gaps logged at INFO.
+
+    Tests use ``time.time`` patching to simulate per-room arrival deltas
+    deterministically — the gap-detection is fundamentally about wall-clock
+    receive intervals, so we drive that signal directly rather than via
+    message-id encoding (which is UUID v8 in production with a non-standard
+    epoch — see ``test_ulid_time_ms_returns_none_for_uuid_v8_production_format``).
+    """
+
+    def _adapter(self, **cfg):
+        adapter = KimiAdapter(_cfg(group_allow_bot_senders="all", **cfg))
+        adapter.handle_message = AsyncMock()  # type: ignore
+        adapter._hydrate_missing_text = False
+        return adapter
+
+    @staticmethod
+    def _msg(chat_id: str, message_id: str) -> "Dict[str, Any]":
+        return {
+            "chatMessage": {
+                "chatId": chat_id,
+                "messageId": message_id,
+                "status": "STATUS_COMPLETED",
+                "role": "ROLE_USER",
+                "senderId": "u1",
+                "senderShortId": "u_real",
+                "blocks": [
+                    {"content": {"case": "text", "value": {"content": "hi"}}}
+                ],
+            }
+        }
+
+    async def test_gap_below_threshold_no_info_log(self):
+        """Delta < threshold (in seconds) → no INFO log."""
+        adapter = self._adapter(burst_drop_gap_log_threshold_s=60.0)
+        records, teardown = _capture_kimi_log_records(level=logging.INFO)
+        # ``time.time`` is called multiple times per _on_group_event (gap
+        # tracking + base-class hooks), so use return_value + manual swap
+        # rather than a fixed-length side_effect.
+        with patch("kimi_adapter.time.time") as mock_time:
+            mock_time.return_value = 1000.0
+            try:
+                await adapter._on_group_event(
+                    self._msg("room-X", "19dc9c4d-93c2-87b8-8000-0a4a0ecd76fe")
+                )
+                mock_time.return_value = 1001.0
+                await adapter._on_group_event(
+                    self._msg("room-X", "19dc9c4f-1262-8c1b-8000-0a4a6c626bbb")
+                )
+            finally:
+                teardown()
+        gap = [r for r in records if "gap candidate" in r.getMessage()]
+        self.assertEqual(gap, [], "small gap should not log gap candidate at INFO")
+
+    async def test_gap_above_threshold_emits_info_log(self):
+        """Delta >= threshold (seconds) → INFO log fires with delta_s, prev_id,
+        connect#, since_reconnect_s. Production UUID-shaped ids accepted —
+        the gap signal is wall-clock-driven so id format is irrelevant."""
+        adapter = self._adapter(burst_drop_gap_log_threshold_s=10.0)
+        records, teardown = _capture_kimi_log_records(level=logging.INFO)
+        with patch("kimi_adapter.time.time") as mock_time:
+            mock_time.return_value = 2000.0
+            try:
+                await adapter._on_group_event(
+                    self._msg("room-Y", "19dc9c4d-93c2-87b8-8000-0a4a0ecd76fe")
+                )
+                mock_time.return_value = 2045.0  # 45s delta, > 10s threshold
+                await adapter._on_group_event(
+                    self._msg("room-Y", "19dc9c4f-1262-8c1b-8000-0a4a6c626bbb")
+                )
+            finally:
+                teardown()
+        gap = [r for r in records if "gap candidate" in r.getMessage()]
+        self.assertEqual(len(gap), 1, f"expected one gap-candidate INFO, got {gap}")
+        rendered = gap[0].getMessage()
+        self.assertIn("room=room-Y", rendered)
+        self.assertIn("prev=19dc9c4d-93c2-87b8-8000-0a4a0ecd76fe", rendered)
+        self.assertIn("delta_s=45.0", rendered)
+        self.assertIn(">=10.0s threshold", rendered)
+        self.assertIn("since_reconnect_s=N/A", rendered)
+        self.assertIn("connect#=0", rendered)
+        self.assertEqual(gap[0].levelno, logging.INFO)
+
+    async def test_gap_log_includes_since_reconnect_correlation(self):
+        """When reconnect timestamp is set, the log includes since_reconnect_s
+        for in-line correlation (Codex review #2 — operators shouldn't have to
+        grep two log streams to correlate)."""
+        adapter = self._adapter(burst_drop_gap_log_threshold_s=10.0)
+        adapter._group_subscribe_reconnect_count = 5
+        adapter._group_subscribe_last_reconnect_ts = 3000.0
+        records, teardown = _capture_kimi_log_records(level=logging.INFO)
+        with patch("kimi_adapter.time.time") as mock_time:
+            mock_time.return_value = 3050.0
+            try:
+                await adapter._on_group_event(
+                    self._msg("room-Z", "19dc9c4d-93c2-87b8-8000-0a4a0ecd76fe")
+                )
+                mock_time.return_value = 3120.0  # 70s gap, 120s after reconnect
+                await adapter._on_group_event(
+                    self._msg("room-Z", "19dc9c4f-1262-8c1b-8000-0a4a6c626bbb")
+                )
+            finally:
+                teardown()
+        gap = [r for r in records if "gap candidate" in r.getMessage()]
+        self.assertEqual(len(gap), 1)
+        rendered = gap[0].getMessage()
+        self.assertIn("since_reconnect_s=120.0", rendered)
+        self.assertIn("connect#=5", rendered)
+
+    async def test_first_message_in_room_no_gap_log(self):
+        """First message has no prior arrival anchor; can't compute delta — no log."""
+        adapter = self._adapter(burst_drop_gap_log_threshold_s=0.001)
+        records, teardown = _capture_kimi_log_records(level=logging.INFO)
+        with patch("kimi_adapter.time.time", return_value=4000.0):
+            try:
+                await adapter._on_group_event(
+                    self._msg("room-W", "19dc9c4f-1262-8c1b-8000-0a4a6c626bbb")
+                )
+            finally:
+                teardown()
+        gap = [r for r in records if "gap candidate" in r.getMessage()]
+        self.assertEqual(gap, [])
+
+    async def test_threshold_zero_disables_info_log(self):
+        """Threshold 0 disables the INFO log entirely."""
+        adapter = self._adapter(burst_drop_gap_log_threshold_s=0)
+        records, teardown = _capture_kimi_log_records(level=logging.INFO)
+        with patch("kimi_adapter.time.time") as mock_time:
+            mock_time.return_value = 5000.0
+            try:
+                await adapter._on_group_event(
+                    self._msg("room-V", "19dc9c4d-93c2-87b8-8000-0a4a0ecd76fe")
+                )
+                mock_time.return_value = 5999.0
+                await adapter._on_group_event(
+                    self._msg("room-V", "19dc9c4f-1262-8c1b-8000-0a4a6c626bbb")
+                )
+            finally:
+                teardown()
+        gap = [r for r in records if "gap candidate" in r.getMessage()]
+        self.assertEqual(gap, [], "threshold=0 must suppress the INFO log")
+
+    async def test_invalid_threshold_falls_back_to_default(self):
+        """Garbage in config doesn't crash startup; default 30.0 applies."""
+        adapter = self._adapter(burst_drop_gap_log_threshold_s="not-a-number")
+        self.assertEqual(adapter._burst_drop_gap_log_threshold_s, 30.0)
+
+    async def test_negative_threshold_clamped_to_zero(self):
+        """Negative values clamp at 0 (which disables the INFO path)."""
+        adapter = self._adapter(burst_drop_gap_log_threshold_s=-5.0)
+        self.assertEqual(adapter._burst_drop_gap_log_threshold_s, 0.0)
+
+
+class GroupSubscribeReconnectCounterTests(unittest.TestCase):
+    """Phase 0 (#18): reconnect counter starts at 0 and is exposed on adapter."""
+
+    def test_counter_initialised_to_zero(self):
+        adapter = KimiAdapter(_cfg())
+        self.assertEqual(adapter._group_subscribe_reconnect_count, 0)
+
+    def test_counter_attribute_exists_for_log_format_consumers(self):
+        """Documents that the counter is a public-shape attribute used in the
+        ``Kimi groups: subscribe stream live`` INFO log. If anything renames
+        or removes this attribute, the log line breaks — operators correlating
+        gap-candidate INFOs against this would lose their anchor."""
+        adapter = KimiAdapter(_cfg())
+        self.assertIsInstance(adapter._group_subscribe_reconnect_count, int)
+
+
+class ListGroupMessagesPaginationTests(unittest.IsolatedAsyncioTestCase):
+    """Phase 0 (#18): list_group_messages now follows nextPageToken up to
+    max_pages, with backward-compat default of single-page (max_pages=1).
+    """
+
+    def _adapter(self):
+        adapter = KimiAdapter(_cfg())
+        adapter._rpc_unary = AsyncMock()  # type: ignore
+        return adapter
+
+    async def test_default_single_page_backward_compat(self):
+        """Default ``max_pages=1`` — single RPC call, ``pageToken`` empty
+        in the request, ``nextPageToken`` in response is ignored."""
+        adapter = self._adapter()
+        adapter._rpc_unary.return_value = {
+            "messages": [{"messageId": "m1"}, {"messageId": "m2"}],
+            "nextPageToken": "page2",  # ignored in single-page mode
+        }
+        result = await adapter.list_group_messages("room-1", limit=20)
+        self.assertEqual(len(result), 2)
+        self.assertEqual(adapter._rpc_unary.await_count, 1)
+        first_call_body = adapter._rpc_unary.await_args[0][1]
+        self.assertEqual(first_call_body["pageToken"], "")
+
+    async def test_multi_page_follows_token(self):
+        """``max_pages>1`` follows ``nextPageToken`` until empty."""
+        adapter = self._adapter()
+        adapter._rpc_unary.side_effect = [
+            {"messages": [{"messageId": "m1"}], "nextPageToken": "tok2"},
+            {"messages": [{"messageId": "m2"}], "nextPageToken": "tok3"},
+            {"messages": [{"messageId": "m3"}], "nextPageToken": ""},
+        ]
+        result = await adapter.list_group_messages("room-1", max_pages=5)
+        self.assertEqual(len(result), 3)
+        self.assertEqual(adapter._rpc_unary.await_count, 3)
+        # Second call should have sent the first page's token.
+        second_body = adapter._rpc_unary.await_args_list[1][0][1]
+        self.assertEqual(second_body["pageToken"], "tok2")
+        third_body = adapter._rpc_unary.await_args_list[2][0][1]
+        self.assertEqual(third_body["pageToken"], "tok3")
+
+    async def test_max_pages_caps_runaway(self):
+        """If Kimi keeps returning a token, ``max_pages`` stops the loop."""
+        adapter = self._adapter()
+        adapter._rpc_unary.return_value = {
+            "messages": [{"messageId": "mX"}],
+            "nextPageToken": "always-more",
+        }
+        result = await adapter.list_group_messages("room-1", max_pages=3)
+        self.assertEqual(adapter._rpc_unary.await_count, 3)
+        self.assertEqual(len(result), 3)
+
+    async def test_empty_pagetoken_breaks_loop_early(self):
+        """First-page empty ``nextPageToken`` → stop after one call even with
+        ``max_pages=10``."""
+        adapter = self._adapter()
+        adapter._rpc_unary.return_value = {
+            "messages": [{"messageId": "only"}],
+            # No nextPageToken at all.
+        }
+        result = await adapter.list_group_messages("room-1", max_pages=10)
+        self.assertEqual(adapter._rpc_unary.await_count, 1)
+        self.assertEqual(len(result), 1)
+
+    async def test_max_pages_below_one_raises(self):
+        """``max_pages=0`` is a config bug — surface it as ValueError."""
+        adapter = self._adapter()
+        with self.assertRaises(ValueError):
+            await adapter.list_group_messages("room-1", max_pages=0)
 
 
 class HakimiLift3aDropLogTests(unittest.IsolatedAsyncioTestCase):

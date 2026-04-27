@@ -102,6 +102,7 @@ If you don't see the `register_platform_adapter` line, the hook isn't present in
 | **Tool calls** | Native streaming via session/update | Tool-call frames are forwarded to the Kimi UI without being filtered. |
 | **Output modes** | `output_mode: tool_only \| passthrough` | `tool_only` suppresses agent text in favour of `SendMessage` tool calls (matches the hakimi pattern). Default is `passthrough`. See [Picking an output_mode](#picking-an-output_mode) below. |
 | **Bounded room state** | `_BoundedLRU(maxsize=N)` on `_rooms`, `_last_message_id_per_room`, `_probe_msg_id_room_counts` | Per-room dicts cap at `room_cache_max_entries` entries (default 500). Eviction does NOT affect message-dispatch correctness (replay-dedup is owned by `_processed_set`, separately bounded). It does have observable side effects under cardinality pressure — see [Bounded room state](#bounded-room-state) below. |
+| **Burst-drop instrumentation** | Gap-candidate INFO logs + reconnect counter + paginated `list_group_messages` | Gathers evidence for whether suspicious per-room timing gaps cluster around stream reconnects. Does NOT recover messages — that's a future Phase 1+. See [Burst-drop instrumentation](#burst-drop-instrumentation) below. |
 | **Onboarding skill** | Embedded `optional-skills/communication/kimi-platform/` | Once enabled in skill settings, agents get a brief on Kimi-specific behaviours (group vs DM, slash semantics, etc.). |
 
 ### Picking an `output_mode`
@@ -149,6 +150,45 @@ platforms:
     extra:
       room_cache_max_entries: 5000
 ```
+
+### Burst-drop instrumentation
+
+Three INFO-level signals gather evidence about message-loss patterns *without* recovering anything. They exist so a future Phase 1+ recovery design can be picked against real production data instead of assumed traffic patterns.
+
+**1. Gap-candidate INFO log.** Tracks **wall-clock arrival time** per room (`time.time()` at the moment each `chatMessage` is processed by the adapter). When the delta between consecutive arrivals in a room is `≥ burst_drop_gap_log_threshold_s` (default 30s, set to 0 to disable):
+
+```
+INFO Kimi groups: gap candidate room=<chat_id> id=<this_id> prev=<prev_id> delta_s=N.N (>=30.0s threshold) since_reconnect_s=K.K connect#=M
+```
+
+Note: this is **wall-clock arrival delta**, not Kimi-`messageId`-embedded timestamp delta. Kimi's production message ids are UUID v8 with a non-standard epoch (their first 48 bits decode to magnitudes ~16× wall-clock seconds), so id-based timestamps are unreliable for time-domain analysis. Wall-clock at receive time is the operator-meaningful signal.
+
+The `since_reconnect_s` and `connect#` fields make correlation against reconnects implicit in a single line — operators don't need to grep two log streams.
+
+This is anomaly-spotting only — most gaps are legitimate (idle room, no traffic). The signal becomes useful when **clusters** of these correlate against reconnects (low `since_reconnect_s` values in burst). At Bloom's typical traffic patterns the default 30s threshold may produce one-off false positives from human conversational pauses; raise to 60-120s if INFO noise becomes distracting.
+
+**2. Reconnect counter + snapshot log.** On the first `chatMessage` post-(re)connect:
+
+```
+INFO Kimi groups: subscribe stream live (connect#N, rooms_tracked=M, prev_backoff=X.Xs)
+```
+
+`connect#N` is monotonic over the adapter lifetime (cold start = #1). The same value also appears in every gap-candidate log line for in-line correlation.
+
+**3. Paginated `list_group_messages`.** The wrapper now follows `nextPageToken` up to a configurable `max_pages` (default 1, backward-compatible with every existing caller). Required for any future recovery design that fetches more than `limit` messages from a gap.
+
+Tunable via `config.extra`:
+
+```yaml
+platforms:
+  kimi:
+    extra:
+      burst_drop_gap_log_threshold_s: 30.0   # 0 disables the gap-candidate INFO
+      # (no config knob for the reconnect counter — always on)
+      # (max_pages is per-call; default 1)
+```
+
+This is **evidence-gathering**, not recovery. Recovery designs (Phase 1+) require a release cycle of this data first to choose between reconnect catch-up vs periodic poll vs gap-triggered.
 
 ## Production reference
 
