@@ -100,8 +100,33 @@ If you don't see the `register_platform_adapter` line, the hook isn't present in
 | **Group rooms** | Connect RPC over WebSocket to the same bot endpoint | Requires the `X-Kimi-OpenClaw-Version` header to be ≥ `2026.3.13` for group participation (the plugin sets this automatically). |
 | **Slash commands** | Pass-through to the Hermes runtime | `/new`, `/compact`, `/status`, etc. handled at the runtime layer. |
 | **Tool calls** | Native streaming via session/update | Tool-call frames are forwarded to the Kimi UI without being filtered. |
-| **Output modes** | `output_mode: tool_only \| passthrough` | `tool_only` suppresses agent text in favour of `SendMessage` tool calls (matches the hakimi pattern). Default is `passthrough`. |
+| **Output modes** | `output_mode: tool_only \| passthrough` | `tool_only` suppresses agent text in favour of `SendMessage` tool calls (matches the hakimi pattern). Default is `passthrough`. See [Picking an output_mode](#picking-an-output_mode) below. |
 | **Onboarding skill** | Embedded `optional-skills/communication/kimi-platform/` | Once enabled in skill settings, agents get a brief on Kimi-specific behaviours (group vs DM, slash semantics, etc.). |
+
+### Picking an `output_mode`
+
+Hermes routes outbound messages to Kimi via two distinct paths, and `output_mode` only gates the first:
+
+| # | Path | Triggered by | Gated by `output_mode`? |
+|---|---|---|---|
+| 1 | `adapter.send()` | The gateway run-loop, for each chunk of agent prose during a streaming turn | **Yes** |
+| 2 | `send_kimi_message()` (module-level helper) | The `send_message_tool` (agent's explicit tool call) and the cron scheduler's Kimi delivery path | **No** |
+
+Modes:
+
+- **`passthrough`** *(default)* — both paths emit. Agent prose streams to Kimi as it's generated, plus tool-driven and cron sends. Matches every other Hermes platform adapter.
+- **`tool_only`** — path 1 is suppressed. Agent prose stays in Hermes logs but never reaches Kimi. Path 2 is unaffected: explicit `send_message_tool` calls and cron-delivered messages still appear normally. The user only sees output that the agent decided to emit via the tool.
+
+When `tool_only` is the right choice:
+- **Group rooms** where streaming prose would be noisy and the agent should emit a single curated reply.
+- **Multi-step agents** where intermediate "thinking out loud" is undesirable platform-side but useful in logs.
+- **Cron-only or tool-only deployments** with no interactive turns.
+
+When to stay on `passthrough`:
+- **1:1 DMs** where the user expects streaming-response UX — silence under `tool_only` looks indistinguishable from a hung bot.
+- **Setups where the agent isn't reliably guided** (system prompt or skill nudge) to call `send_message_tool`. Without that guidance, `tool_only` makes the bot appear mute on every turn.
+
+This flag exists because the bridge's previous workaround (`HIDE_TOOL_CALLS=1`) hung Hermes over stdio. The adapter's in-process coupling lets the suppression happen at the right layer without that deadlock.
 
 ## Production reference
 

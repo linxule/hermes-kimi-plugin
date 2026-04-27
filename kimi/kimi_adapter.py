@@ -1057,14 +1057,52 @@ class KimiAdapter(BasePlatformAdapter):
         self._pending_enqueued_at: Dict[str, float] = {}
 
         # ── Lift 3b: output_mode flag ─────────────────────────────────────
-        # ``passthrough`` (default): agent prose + tool output both reach
-        #   Kimi via ``send()``.
-        # ``tool_only``: ``send()`` is gated — only explicit ``send_message_tool``
-        #   calls (which bypass ``adapter.send()`` and use the standalone
-        #   ``send_kimi_message`` function) produce visible Kimi messages.
-        #   Agent intermediate prose stays in Hermes logs only.
-        # Solving the bridge's ``HIDE_TOOL_CALLS=1``-hangs-Hermes problem at
-        # the source: adapter's in-process coupling differs from bridge stdio.
+        #
+        # Two-path architecture: Hermes routes outbound messages to Kimi via
+        # two distinct entry points, and ``output_mode`` controls only the
+        # first.
+        #
+        #   1. ``adapter.send()`` ← gateway run-loop calls this for each agent
+        #      prose chunk during a streaming turn. This is what generates
+        #      "the agent typing back to you in chat" UX. Gated by
+        #      ``output_mode``.
+        #
+        #   2. ``send_kimi_message()`` ← module-level helper at the bottom of
+        #      this file. Invoked by ``tools/send_message_tool.py::_send_kimi``
+        #      (the agent-facing ``send_message_tool``) and by the cron
+        #      scheduler's Kimi delivery path. Bypasses ``adapter.send()``
+        #      entirely → never gated by ``output_mode``.
+        #
+        # Modes:
+        #   ``passthrough`` (default) — both paths emit. Agent prose streams
+        #     to Kimi as it's generated; explicit tool calls + cron deliveries
+        #     also work. Production-default; matches every other Hermes
+        #     platform adapter.
+        #   ``tool_only`` — path (1) is suppressed (``send()`` returns early
+        #     with success=True). The agent's prose still appears in Hermes
+        #     logs but is not relayed to Kimi. Path (2) is unaffected — tool-
+        #     driven sends and cron deliveries work normally. The user sees
+        #     output only when the agent explicitly invokes
+        #     ``send_message_tool``.
+        #
+        # When to use ``tool_only``:
+        #   • Group rooms where streaming prose would be noisy and the agent
+        #     should emit a single curated reply via the tool.
+        #   • Multi-step agents where intermediate "thinking out loud" is
+        #     undesirable platform-side but useful in logs.
+        #   • Cron-only or tool-only deployments (no interactive turns).
+        #
+        # When NOT to use ``tool_only``:
+        #   • 1:1 DMs where the user expects streaming response UX — silence
+        #     looks like the bot hung.
+        #   • Setups where the agent isn't reliably guided (system prompt or
+        #     skill nudge) to call ``send_message_tool``. Without that
+        #     guidance, the bot will appear mute on every turn.
+        #
+        # Background — this flag exists because the bridge's
+        # ``HIDE_TOOL_CALLS=1`` filter, the prior workaround, hung Hermes
+        # over stdio. The adapter's in-process coupling lets us suppress at
+        # the right layer without that deadlock.
         _raw_mode = config.extra.get("output_mode", "passthrough")
         if _raw_mode not in ("passthrough", "tool_only"):
             logger.warning(
