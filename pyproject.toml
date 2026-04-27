@@ -62,12 +62,21 @@ Issues = "https://github.com/linxule/hermes-kimi-plugin/issues"
 # things while looking like it succeeded. Pip-installable distribution is
 # deferred until upstream documents a site-packages plugin-discovery path.
 [tool.hatch.build.targets.wheel]
-# Empty packages list → hatchling builds a metadata-only wheel (no source files
-# shipped). `pip install -e '.[dev]'` still resolves and installs deps. The
-# plugin code is intentionally not in the wheel because (a) it doesn't belong
-# in site-packages, (b) flat-wheel layout would clash with other packages.
-packages = []
-only-include = []
+# Metadata-only wheel: ships LICENSE only, NO Python code. We need the wheel
+# build to succeed so `pip install -e '.[dev]'` works for test deps in CI and
+# locally, but we don't want any plugin code in site-packages — the Hermes
+# plugin loader discovers from $HERMES_HOME/plugins/, not site-packages, so
+# shipping flat code there would silently break things while looking like it
+# installed correctly. A flat-wheel layout (kimi/__init__.py at site-packages
+# top level) would also clash with anything else using flat layout.
+#
+# Empty `packages = []` and `only-include = []` ARE rejected by hatchling
+# (it falls back to the auto-detect heuristic and raises ValueError because
+# there's no directory matching the project name `hermes_kimi_plugin`).
+# `only-include = ["LICENSE"]` is the smallest reliable form: ships nothing
+# executable, satisfies hatchling's file-selection requirement, and includes
+# the LICENSE which a distributed wheel should carry anyway.
+only-include = ["LICENSE"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
