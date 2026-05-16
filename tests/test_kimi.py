@@ -34,6 +34,7 @@ from kimi_adapter import (
     _BoundedLRU,
     _extract_blocks_payload,
     _extract_short_id_from_text,
+    _resolve_env_template,
     _extract_user_identity,
     _is_standalone_slash_command,
     _parse_iso8601,
@@ -130,6 +131,69 @@ class RequirementsTests(unittest.TestCase):
     def test_dependencies_available(self):
         # websockets + aiohttp are hermes core deps — this should always pass.
         self.assertTrue(check_kimi_requirements())
+
+
+class EnvTemplateResolverTests(unittest.TestCase):
+    """Regression test for the 2026-05-16 token-substitution bug.
+
+    Hermes does not invoke ``${VAR}`` substitution for external-plugin
+    PlatformConfig fields, so ``token: ${KIMI_BOT_TOKEN}`` in config.yaml
+    used to arrive as a truthy literal and short-circuit the
+    ``or os.getenv(...)`` fallback chain in ``__init__``.  The adapter
+    then sent the template string to kimi.com as the bot token (HTTP 401).
+    """
+
+    def test_resolves_dollar_brace_to_env(self):
+        with patch.dict(os.environ, {"PROBE_VAR_A": "actual-secret-value"}, clear=False):
+            self.assertEqual(
+                _resolve_env_template("${PROBE_VAR_A}"), "actual-secret-value"
+            )
+
+    def test_unset_env_var_returns_empty(self):
+        # Ensure the variable is unset.
+        os.environ.pop("PROBE_VAR_UNSET_XYZ", None)
+        self.assertEqual(_resolve_env_template("${PROBE_VAR_UNSET_XYZ}"), "")
+
+    def test_plain_string_passthrough(self):
+        self.assertEqual(_resolve_env_template("km_b_prod_real_token"), "km_b_prod_real_token")
+
+    def test_none_returns_empty(self):
+        self.assertEqual(_resolve_env_template(None), "")
+
+    def test_partial_template_passthrough(self):
+        # Strings that *look* like templates but don't match the full
+        # ``${...}`` shape are passed through unchanged.
+        self.assertEqual(_resolve_env_template("${incomplete"), "${incomplete")
+        self.assertEqual(_resolve_env_template("trailing${VAR}"), "trailing${VAR}")
+        self.assertEqual(_resolve_env_template("${}"), "${}")
+
+    def test_whitespace_inside_template(self):
+        with patch.dict(os.environ, {"PROBE_VAR_B": "spaced-value"}, clear=False):
+            self.assertEqual(
+                _resolve_env_template("${ PROBE_VAR_B }"), "spaced-value"
+            )
+
+    def test_non_string_coerces(self):
+        self.assertEqual(_resolve_env_template(42), "42")
+        self.assertEqual(_resolve_env_template(True), "True")
+
+
+class AdapterTokenResolutionTests(unittest.TestCase):
+    """End-to-end: the adapter ``__init__`` resolves ``${KIMI_BOT_TOKEN}``
+    in ``config.token`` from the env, not literally."""
+
+    def test_template_in_config_token_resolves_from_env(self):
+        cfg = PlatformConfig(
+            enabled=True,
+            token="${KIMI_BOT_TOKEN}",  # the bug pattern
+            extra={"enable_dms": True, "enable_groups": False},
+        )
+        with patch.dict(
+            os.environ, {"KIMI_BOT_TOKEN": "km_b_prod_RESOLVED_TOKEN"}, clear=False
+        ):
+            adapter = KimiAdapter(cfg)
+        self.assertEqual(adapter._bot_token, "km_b_prod_RESOLVED_TOKEN")
+        self.assertNotIn("${", adapter._bot_token)
 
 
 class AdapterInitTests(unittest.TestCase):

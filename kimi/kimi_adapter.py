@@ -753,6 +753,42 @@ def _header_value(value: Any) -> Optional[str]:
     return str(value)
 
 
+def _resolve_env_template(value: Any) -> str:
+    """Resolve ``${VAR}`` template strings against the environment.
+
+    Defensive against Hermes config-loading paths that do not invoke
+    env-var substitution for external-plugin platforms.  In particular,
+    when ``platforms.kimi.token: ${KIMI_BOT_TOKEN}`` appears in
+    ``~/.hermes/config.yaml``, the kimi plugin (registered via
+    ``ctx.register_platform()``) receives the LITERAL string
+    ``"${KIMI_BOT_TOKEN}"`` rather than the resolved env value.  The
+    adapter's bot-token fallback chain previously short-circuited on
+    that truthy-but-bogus value, sending the template string to
+    kimi.com and getting 401 ``unauthenticated``.
+
+    Returns:
+        - For a ``"${NAME}"`` literal: the value of env var ``NAME``
+          (``""`` if unset).
+        - For any other string: the string unchanged.
+        - For ``None``: ``""``.
+        - For non-strings: ``str(value)``.
+    """
+    if value is None:
+        return ""
+    if not isinstance(value, str):
+        return str(value)
+    stripped = value.strip()
+    if (
+        stripped.startswith("${")
+        and stripped.endswith("}")
+        and len(stripped) >= 4  # at least ${X}
+    ):
+        var_name = stripped[2:-1].strip()
+        if var_name:
+            return os.getenv(var_name, "")
+    return value
+
+
 def _normalize_openclaw_plugins(value: Any, claw_version: Any) -> Any:
     """Accept legacy string config while emitting Kimi Claw's JSON shape."""
     if not isinstance(value, str):
@@ -986,10 +1022,16 @@ class KimiAdapter(BasePlatformAdapter):
         # gateway/config.py::Platform._missing_ for the mechanism.
         super().__init__(config, Platform("kimi"))
 
-        # Credentials
+        # Credentials — ``_resolve_env_template`` guards against the
+        # ``token: ${KIMI_BOT_TOKEN}`` config.yaml pattern arriving
+        # unsubstituted (Hermes does not run env-var substitution for
+        # external-plugin platform config).  Without it, the literal
+        # ``"${KIMI_BOT_TOKEN}"`` would short-circuit the ``or`` chain
+        # before the env-var fallback fires, and that template string
+        # would be sent to kimi.com as the bot token (HTTP 401).
         self._bot_token: str = (
-            config.token
-            or config.extra.get("bot_token", "")
+            _resolve_env_template(config.token)
+            or _resolve_env_template(config.extra.get("bot_token", ""))
             or os.getenv("KIMI_BOT_TOKEN", "")
         )
 
