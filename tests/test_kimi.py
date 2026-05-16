@@ -44,6 +44,35 @@ from kimi_adapter import (
 from gateway.session import SessionSource
 
 
+def setUpModule():
+    """Make ``Platform("kimi")`` resolvable in tests by populating the registry.
+
+    The plugin's :func:`kimi_adapter.register` does this via
+    ``ctx.register_platform()`` in production, but tests don't go through
+    the plugin discovery flow.  Without this fixture, every test that
+    constructs ``KimiAdapter`` or compares platforms fails because
+    ``Platform._missing_`` returns ``None`` for unregistered names and
+    ``Platform("kimi")`` raises ``ValueError``.
+
+    Skips silently in pre-v0.13.0 envs where ``gateway.platform_registry``
+    doesn't exist — tests that depend on the new API will then fail with
+    the same ``ImportError``/``ValueError`` they would at runtime, which
+    is the right diagnostic signal.
+    """
+    try:
+        from gateway.platform_registry import platform_registry, PlatformEntry
+    except ImportError:
+        return
+
+    if not platform_registry.is_registered("kimi"):
+        platform_registry.register(PlatformEntry(
+            name="kimi",
+            label="Kimi",
+            adapter_factory=lambda cfg: None,  # not invoked in unit tests
+            check_fn=lambda: True,
+        ))
+
+
 class _FakeWSStatusError(Exception):
     """Mimic websockets 12+ upgrade-rejection exception shape."""
     def __init__(self, status: int):
@@ -347,7 +376,7 @@ class MessageEventSynthesisTests(unittest.TestCase):
         )
         self.assertEqual(event.text, "hello")
         self.assertEqual(event.message_type, MessageType.TEXT)
-        self.assertEqual(event.source.platform, Platform.KIMI)
+        self.assertEqual(event.source.platform, Platform("kimi"))
         self.assertEqual(event.source.chat_id, "room:abc")
         self.assertEqual(event.source.chat_type, "group")
         self.assertFalse(event.internal)
@@ -1242,119 +1271,88 @@ class OutboundMentionRenderingTests(unittest.IsolatedAsyncioTestCase):
 
 
 class ConfigIntegrationTests(unittest.TestCase):
-    """Platform enum + env-var pickup via gateway.config."""
+    """Plugin-side config bridge: env vars, YAML translation, validate_config.
 
-    def test_platform_enum_exists(self):
-        self.assertEqual(Platform.KIMI.value, "kimi")
+    Replaces the older Fork-only tests that exercised in-fork
+    ``_apply_env_overrides`` and the hardcoded ``Platform.KIMI`` auth env-maps
+    in ``gateway/run.py``.  Both of those layers are now plugin-owned via the
+    upstream ``PlatformEntry`` registry (see :func:`kimi_adapter.register`).
+    """
 
-    @unittest.skip(
-        "Fork-only: requires _apply_env_overrides to know about KIMI_BOT_TOKEN. "
-        "That env-var wiring lives in the in-fork gateway/config.py "
-        "(feat/kimi-platform-adapter), not in the clean enum-only branch this "
-        "standalone repo's CI installs. When the plugin is adopted upstream, "
-        "the env-var loading is expected to move into the plugin's own register() "
-        "or be added to upstream config.py as part of the same change-set."
-    )
-    def test_env_override_loads_token(self):
-        from gateway.config import GatewayConfig, _apply_env_overrides
-        cfg = GatewayConfig()
-        with patch.dict(os.environ, {"KIMI_BOT_TOKEN": "km_b_prod_ENV_TEST"}, clear=False):
-            _apply_env_overrides(cfg)
-        kimi_cfg = cfg.platforms.get(Platform.KIMI)
-        self.assertIsNotNone(kimi_cfg)
-        self.assertEqual(kimi_cfg.token, "km_b_prod_ENV_TEST")
-        self.assertTrue(kimi_cfg.enabled)
+    def test_platform_kimi_resolves_via_registry(self):
+        """After ``setUpModule`` registration, ``Platform('kimi')`` yields a stable pseudo-member."""
+        p = Platform("kimi")
+        self.assertEqual(p.value, "kimi")
+        self.assertIs(p, Platform("kimi"))  # identity-stable
 
+    def test_validate_config_with_env_token(self):
+        from kimi_adapter import validate_config
+        with patch.dict(os.environ, {"KIMI_BOT_TOKEN": "km_b_prod_TEST"}, clear=False):
+            self.assertTrue(validate_config(_cfg()))
 
-@unittest.skip(
-    "Fork-only: these tests verify that gateway/run.py has Platform.KIMI "
-    "entries in the authorization allowlist maps + the home-channel nag-guard. "
-    "That wiring lives in the in-fork gateway/run.py (feat/kimi-platform-adapter), "
-    "not in the clean enum-only branch this standalone repo's CI installs. "
-    "Standalone-distribution tests cover what the *plugin* is responsible for; "
-    "the in-tree allowlist/nag wiring is a separate change-set tied to enum "
-    "adoption upstream."
-)
-class AuthorizationIntegrationTests(unittest.TestCase):
-    """Platform appears in the authorization maps in run.py."""
+    def test_validate_config_with_extra_token(self):
+        from kimi_adapter import validate_config
+        env_no_token = {k: v for k, v in os.environ.items() if k != "KIMI_BOT_TOKEN"}
+        with patch.dict(os.environ, env_no_token, clear=True):
+            cfg = PlatformConfig(enabled=True, extra={"bot_token": "km_b_prod_TEST"})
+            self.assertTrue(validate_config(cfg))
 
-    def test_platform_in_allowlist_maps(self):
-        # Lightweight smoke test — we read the file instead of importing
-        # gateway.run (which has heavy side effects). Resolve the path via
-        # the installed package so the test works in both the in-fork
-        # checkout and the standalone-plugin layout (where this test file
-        # is at tests/test_kimi.py rather than tests/gateway/test_kimi.py).
-        import pathlib
-        import gateway
-        run_py = pathlib.Path(gateway.__file__).parent / "run.py"
-        text = run_py.read_text()
-        self.assertIn('Platform.KIMI: "KIMI_ALLOWED_USERS"', text)
-        self.assertIn('Platform.KIMI: "KIMI_ALLOW_ALL_USERS"', text)
+    def test_validate_config_missing_token(self):
+        from kimi_adapter import validate_config
+        env_no_kimi = {k: v for k, v in os.environ.items()
+                       if not k.startswith("KIMI_")}
+        with patch.dict(os.environ, env_no_kimi, clear=True):
+            cfg = PlatformConfig(enabled=True, extra={})
+            self.assertFalse(validate_config(cfg))
 
-    def test_nag_guard_uses_config_get_home_channel(self):
-        """Source-level verification that the nag-guard fix is still in place.
+    def test_env_enablement_returns_token_dict(self):
+        from kimi_adapter import _env_enablement
+        with patch.dict(os.environ, {"KIMI_BOT_TOKEN": "km_b_prod_TEST"}, clear=False):
+            result = _env_enablement()
+        self.assertIsNotNone(result)
+        self.assertEqual(result["bot_token"], "km_b_prod_TEST")
 
-        ``HomeChannelNagGuardTests`` exercises the two-source guard by
-        replicating the condition in Python, which would still pass if a
-        future edit regressed the prod code back to ``os.getenv``-only.
-        Anchor the test to the production expression directly so that
-        regression would surface here.
-        """
-        import pathlib
-        import gateway
-        run_py = pathlib.Path(gateway.__file__).parent / "run.py"
-        text = run_py.read_text()
-        self.assertIn("self.config.get_home_channel(source.platform)", text)
+    def test_env_enablement_returns_none_without_token(self):
+        from kimi_adapter import _env_enablement
+        env_no_token = {k: v for k, v in os.environ.items() if k != "KIMI_BOT_TOKEN"}
+        with patch.dict(os.environ, env_no_token, clear=True):
+            result = _env_enablement()
+        self.assertIsNone(result)
 
-    def test_group_allowlist_accepts_raw_room_id(self):
-        from gateway.run import GatewayRunner
-
-        runner = object.__new__(GatewayRunner)
-        runner.config = GatewayConfig(platforms={Platform.KIMI: PlatformConfig(enabled=True)})
-        runner.adapters = {Platform.KIMI: SimpleNamespace(send=AsyncMock())}
-        runner.pairing_store = MagicMock()
-        runner.pairing_store.is_approved.return_value = False
-
-        source = SessionSource(
-            platform=Platform.KIMI,
-            user_id="kimi:user-1",
-            chat_id="room:chat-1",
-            user_name="tester",
-            chat_type="group",
-        )
-
+    def test_env_enablement_includes_home_channel(self):
+        from kimi_adapter import _env_enablement
         with patch.dict(os.environ, {
-            "KIMI_GROUP_ALLOWED_USERS": "chat-1",
-            "KIMI_ALLOWED_USERS": "",
-            "GATEWAY_ALLOWED_USERS": "",
-            "GATEWAY_ALLOW_ALL_USERS": "",
+            "KIMI_BOT_TOKEN": "tok",
+            "KIMI_HOME_CHANNEL": "im:kimi:main",
         }, clear=False):
-            self.assertTrue(runner._is_user_authorized(source))
+            result = _env_enablement()
+        self.assertEqual(result["home_channel"], "im:kimi:main")
 
-    def test_group_allowlist_accepts_prefixed_room_id(self):
-        from gateway.run import GatewayRunner
+    def test_apply_yaml_config_populates_env(self):
+        from kimi_adapter import _apply_yaml_config
+        env_no_kimi = {k: v for k, v in os.environ.items()
+                       if not k.startswith("KIMI_")}
+        with patch.dict(os.environ, env_no_kimi, clear=True):
+            _apply_yaml_config({}, {
+                "bot_token": "km_b_prod_FROM_YAML",
+                "home_channel": "room:abc",
+                "allowed_users": ["u1", "u2"],
+            })
+            self.assertEqual(os.environ.get("KIMI_BOT_TOKEN"), "km_b_prod_FROM_YAML")
+            self.assertEqual(os.environ.get("KIMI_HOME_CHANNEL"), "room:abc")
+            self.assertEqual(os.environ.get("KIMI_ALLOWED_USERS"), "u1,u2")
 
-        runner = object.__new__(GatewayRunner)
-        runner.config = GatewayConfig(platforms={Platform.KIMI: PlatformConfig(enabled=True)})
-        runner.adapters = {Platform.KIMI: SimpleNamespace(send=AsyncMock())}
-        runner.pairing_store = MagicMock()
-        runner.pairing_store.is_approved.return_value = False
+    def test_apply_yaml_config_respects_env_precedence(self):
+        from kimi_adapter import _apply_yaml_config
+        with patch.dict(os.environ, {"KIMI_BOT_TOKEN": "km_b_prod_ENV_WINS"}, clear=False):
+            _apply_yaml_config({}, {"bot_token": "km_b_prod_YAML_LOSES"})
+            self.assertEqual(os.environ["KIMI_BOT_TOKEN"], "km_b_prod_ENV_WINS")
 
-        source = SessionSource(
-            platform=Platform.KIMI,
-            user_id="kimi:user-1",
-            chat_id="room:chat-1",
-            user_name="tester",
-            chat_type="group",
-        )
-
-        with patch.dict(os.environ, {
-            "KIMI_GROUP_ALLOWED_USERS": "room:chat-1",
-            "KIMI_ALLOWED_USERS": "",
-            "GATEWAY_ALLOWED_USERS": "",
-            "GATEWAY_ALLOW_ALL_USERS": "",
-        }, clear=False):
-            self.assertTrue(runner._is_user_authorized(source))
+    def test_apply_yaml_config_ignores_non_dict(self):
+        from kimi_adapter import _apply_yaml_config
+        # platform_cfg can be None or a non-dict when the YAML key is absent
+        self.assertIsNone(_apply_yaml_config({}, None))
+        self.assertIsNone(_apply_yaml_config({}, "not a dict"))
 
 
 class UserIdentityExtractionTests(unittest.TestCase):
@@ -2075,11 +2073,11 @@ class HomeChannelNagGuardTests(unittest.IsolatedAsyncioTestCase):
     def test_home_channel_nag_suppressed_when_config_has_home_channel(self):
         config = GatewayConfig(
             platforms={
-                Platform.KIMI: PlatformConfig(
+                Platform("kimi"): PlatformConfig(
                     enabled=True,
                     token="tok",
                     home_channel=HomeChannel(
-                        platform=Platform.KIMI,
+                        platform=Platform("kimi"),
                         chat_id="room:abc",
                         name="Home",
                     ),
@@ -2087,18 +2085,18 @@ class HomeChannelNagGuardTests(unittest.IsolatedAsyncioTestCase):
             },
         )
         # Config has a home channel; env is empty — nag must NOT fire.
-        self.assertFalse(self._evaluate_nag_condition(config, Platform.KIMI, env_key_present=False))
+        self.assertFalse(self._evaluate_nag_condition(config, Platform("kimi"), env_key_present=False))
         # Sanity: the config API used by the fix returns the HomeChannel object.
-        self.assertIsNotNone(config.get_home_channel(Platform.KIMI))
+        self.assertIsNotNone(config.get_home_channel(Platform("kimi")))
 
     def test_home_channel_nag_fires_when_both_env_and_config_empty(self):
         """True first-run: no env, no config → operator should be prompted."""
         config = GatewayConfig(
-            platforms={Platform.KIMI: PlatformConfig(enabled=True, token="tok")},
+            platforms={Platform("kimi"): PlatformConfig(enabled=True, token="tok")},
         )
-        self.assertTrue(self._evaluate_nag_condition(config, Platform.KIMI, env_key_present=False))
+        self.assertTrue(self._evaluate_nag_condition(config, Platform("kimi"), env_key_present=False))
         # Env-set first-run path still suppresses (preserved behavior).
-        self.assertFalse(self._evaluate_nag_condition(config, Platform.KIMI, env_key_present=True))
+        self.assertFalse(self._evaluate_nag_condition(config, Platform("kimi"), env_key_present=True))
 
 
 def _capture_kimi_log_records(level: int = logging.DEBUG):
@@ -3031,7 +3029,7 @@ def _make_message_event(text: str = "hello", chat_id: str = "dm:im:kimi:main") -
     from gateway.config import Platform
 
     source = SessionSource(
-        platform=Platform.KIMI,
+        platform=Platform("kimi"),
         chat_id=chat_id,
         chat_type="dm",
         user_id="kimi:user:1",
@@ -4121,6 +4119,89 @@ class HakimiLift3bOutputModeInitTests(unittest.TestCase):
         ]
         self.assertEqual(len(warnings), 1)
         self.assertIn("robot_only", warnings[0].getMessage())
+
+
+class PluginRegistrationTests(unittest.TestCase):
+    """Verify ``register()`` populates the expected ``PlatformEntry`` fields.
+
+    Replaces the older Fork-only ``AuthorizationIntegrationTests`` which
+    scraped ``gateway/run.py`` source for hardcoded ``Platform.KIMI`` map
+    entries.  All of that wiring is now plugin-owned via the upstream
+    ``ctx.register_platform()`` API — these tests assert the call's kwargs
+    instead of poking the gateway's source code.
+    """
+
+    def test_register_calls_ctx_with_expected_fields(self):
+        from kimi_adapter import register
+
+        ctx = MagicMock()
+        register(ctx)
+
+        ctx.register_platform.assert_called_once()
+        kwargs = ctx.register_platform.call_args.kwargs
+
+        # Identity
+        self.assertEqual(kwargs["name"], "kimi")
+        self.assertEqual(kwargs["label"], "Kimi")
+
+        # Auth env-var mapping (replaces fork's gateway/run.py auth env-maps).
+        self.assertEqual(kwargs["allowed_users_env"], "KIMI_ALLOWED_USERS")
+        self.assertEqual(kwargs["allow_all_env"], "KIMI_ALLOW_ALL_USERS")
+
+        # Cron delivery (replaces fork's cron/scheduler.py wiring).
+        self.assertEqual(kwargs["cron_deliver_env_var"], "KIMI_HOME_CHANNEL")
+
+        # Required env
+        self.assertEqual(kwargs["required_env"], ["KIMI_BOT_TOKEN"])
+
+        # Display flags
+        self.assertEqual(kwargs["emoji"], "🌙")
+        self.assertTrue(kwargs["pii_safe"])
+        self.assertTrue(kwargs["allow_update_command"])
+
+        # Callable hooks must all be present + callable.
+        self.assertTrue(callable(kwargs["adapter_factory"]))
+        self.assertTrue(callable(kwargs["check_fn"]))
+        self.assertTrue(callable(kwargs["validate_config"]))
+        self.assertTrue(callable(kwargs["is_connected"]))
+        self.assertTrue(callable(kwargs["env_enablement_fn"]))
+        self.assertTrue(callable(kwargs["apply_yaml_config_fn"]))
+        self.assertTrue(callable(kwargs["setup_fn"]))
+
+        # Platform hint mentions Kimi explicitly.
+        self.assertIn("Kimi", kwargs["platform_hint"])
+        self.assertIn("kimi.com", kwargs["platform_hint"])
+
+        # Install hint references the upstream commit so operators can find it.
+        self.assertIn("2e20f6ae2", kwargs["install_hint"])
+
+        # Message-length guidance present for smart-chunking.
+        self.assertGreater(kwargs["max_message_length"], 0)
+
+    def test_register_factory_constructs_adapter(self):
+        """The factory passed to ``register_platform`` actually constructs a KimiAdapter."""
+        from kimi_adapter import register
+
+        ctx = MagicMock()
+        register(ctx)
+        factory = ctx.register_platform.call_args.kwargs["adapter_factory"]
+        adapter = factory(_cfg())
+        self.assertIsInstance(adapter, KimiAdapter)
+
+    def test_register_check_fn_passes_in_dev_env(self):
+        """``check_fn`` returns True when websockets + aiohttp are importable.
+
+        Both are hermes core deps so this should always pass in any env
+        where the plugin is being tested. Mirrors the existing
+        :class:`RequirementsTests` assertion.
+        """
+        from kimi_adapter import register
+
+        ctx = MagicMock()
+        register(ctx)
+        check_fn = ctx.register_platform.call_args.kwargs["check_fn"]
+        self.assertTrue(check_fn())
+
 
 if __name__ == "__main__":
     unittest.main()

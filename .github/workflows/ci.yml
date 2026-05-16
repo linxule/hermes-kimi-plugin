@@ -32,16 +32,19 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
 
-      - name: Install hermes-agent (clean dep target)
-        # feat/platform-kimi-enum is the prospective bundled-PR branch — it
-        # carries the registry hook + Platform.KIMI enum, but NOT this plugin's
-        # in-tree code. Pinning to it gives us a clean dependency that doesn't
-        # ship a competing plugins/kimi/ alongside this standalone repo.
+      - name: Install hermes-agent (upstream main)
+        # We install from upstream main so this CI doubles as a kill-switch
+        # for upstream drift: if a future commit on NousResearch/hermes-agent
+        # removes/renames a symbol this plugin depends on, the schedule run
+        # at 06:00 UTC surfaces the breakage as a CI failure rather than a
+        # silent production issue.
         #
-        # Once both upstream PRs land (or get bundled), switch this to
-        # 'hermes-agent>=<version>' from PyPI.
+        # Floor for the plugin's public contract is hermes-agent >= 0.13.0
+        # (apply_yaml_config_fn registry hook, shipped 2026-05-13 in 3633c8690;
+        # ctx.register_platform shipped 2026-04-11 in 2e20f6ae2 / v0.11.0).
+        # See pyproject.toml.
         run: |
-          pip install 'hermes-agent @ git+https://github.com/linxule/hermes-agent.git@feat/platform-kimi-enum'
+          pip install 'hermes-agent @ git+https://github.com/NousResearch/hermes-agent.git@main'
 
       - name: Install plugin dev deps
         # The wheel is intentionally metadata-only (see pyproject.toml).
@@ -56,11 +59,11 @@ jobs:
         # Replicates the Hermes plugin loader's directory-module setup exactly
         # (see hermes_cli/plugins.py::_load_directory_module). Confirms that
         # register() can be invoked against the installed hermes-agent without
-        # raising, that it binds Platform.KIMI to a callable factory, and that
-        # the relative imports inside kimi/__init__.py resolve under the
-        # hermes_plugins.<name> namespace. Catches gaps the unit suite can't
-        # (the unit suite exercises the adapter; this exercises the loader
-        # handshake).
+        # raising, that it calls ctx.register_platform with the expected kwargs,
+        # and that the relative imports inside kimi/__init__.py resolve under
+        # the hermes_plugins.<name> namespace.  Catches gaps the unit suite
+        # can't (the unit suite exercises the adapter; this exercises the
+        # loader handshake against the installed hermes-agent).
         run: |
           python - <<'EOF'
           import sys
@@ -70,8 +73,8 @@ jobs:
           _NS_PARENT = 'hermes_plugins'
 
           # Ensure the namespace parent package exists in sys.modules. Without
-          # this, ``from . import _compat`` inside kimi/__init__.py raises
-          # ModuleNotFoundError because the parent package isn't findable.
+          # this, relative imports inside the plugin raise ModuleNotFoundError
+          # because the parent package isn't findable.
           if _NS_PARENT not in sys.modules:
               ns_pkg = types.ModuleType(_NS_PARENT)
               ns_pkg.__path__ = []
@@ -90,19 +93,35 @@ jobs:
           sys.modules[module_name] = mod
           spec.loader.exec_module(mod)
 
-          from gateway.config import Platform
+          # Stub PluginContext that records the register_platform call shape.
           recorded = {}
           class StubCtx:
-              def register_platform_adapter(self, platform, factory, requirements_check=None):
-                  recorded['platform'] = platform
-                  recorded['factory'] = factory
-                  recorded['requirements_check'] = requirements_check
+              def register_platform(self, **kwargs):
+                  recorded.update(kwargs)
 
           mod.register(StubCtx())
-          assert recorded['platform'] is Platform.KIMI, (
-              f"Expected Platform.KIMI, got {recorded['platform']!r}"
+
+          # The plugin must request the canonical Kimi registration shape.
+          assert recorded.get('name') == 'kimi', f"name: {recorded.get('name')!r}"
+          assert recorded.get('label') == 'Kimi', f"label: {recorded.get('label')!r}"
+          assert recorded.get('allowed_users_env') == 'KIMI_ALLOWED_USERS'
+          assert recorded.get('allow_all_env') == 'KIMI_ALLOW_ALL_USERS'
+          assert recorded.get('cron_deliver_env_var') == 'KIMI_HOME_CHANNEL'
+          assert recorded.get('required_env') == ['KIMI_BOT_TOKEN']
+          assert callable(recorded.get('adapter_factory'))
+          assert callable(recorded.get('check_fn'))
+          assert callable(recorded.get('apply_yaml_config_fn'))
+          assert callable(recorded.get('env_enablement_fn'))
+
+          # Verify the adapter_factory actually constructs a KimiAdapter
+          # against a minimal PlatformConfig — catches constructor regressions.
+          from gateway.config import PlatformConfig
+          adapter = recorded['adapter_factory'](
+              PlatformConfig(enabled=True, token='km_b_prod_SMOKE', extra={})
           )
-          assert callable(recorded['factory']), "factory must be callable"
-          assert callable(recorded['requirements_check']), "requirements_check must be callable"
-          print('smoke ok: register() bound the kimi factory to Platform.KIMI')
+          assert adapter.__class__.__name__ == 'KimiAdapter', (
+              f"adapter type: {adapter.__class__.__name__}"
+          )
+
+          print('smoke ok: register() called ctx.register_platform with the expected shape')
           EOF

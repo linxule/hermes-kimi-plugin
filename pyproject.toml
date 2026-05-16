@@ -4,8 +4,8 @@ build-backend = "hatchling.build"
 
 [project]
 name = "hermes-kimi-plugin"
-version = "1.0.0"
-description = "Kimi (kimi.com / Moonshot AI) chat platform adapter for Hermes Agent — DM + group rooms under one bot identity"
+version = "2.0.0"
+description = "Kimi (kimi.com / Moonshot AI) chat platform adapter for Hermes Agent — DM + group rooms under one bot identity. Uses upstream ctx.register_platform() API."
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "MIT" }
@@ -28,12 +28,12 @@ classifiers = [
 # declaration, project URLs) only — there's no build-system section because
 # this plugin is NOT pip-installable. See the wheel-target NOTE below.
 dependencies = [
-    # The plugin uses Hermes Agent APIs (gateway.config, gateway.platforms.base,
-    # gateway.platforms.registry) AND requires Platform.KIMI in the closed enum.
-    # Until both land upstream, install from a branch that carries both:
-    #   pip install 'hermes-agent @ git+https://github.com/linxule/hermes-agent.git@feat/kimi-plugin-variant'
-    # See README "Install" section for the full procedure.
-    "hermes-agent>=0.11.0",
+    # v2.0.0 (this release): uses upstream's canonical platform-plugin API
+    # introduced by Teknium's 2e20f6ae2 (plugin platform parity, v0.11.0)
+    # and the apply_yaml_config_fn registry hook in 3633c8690 (v0.13.0).
+    # The closed Platform enum's _missing_ classmethod auto-creates a
+    # pseudo-member for plugin names, so no upstream patches are needed.
+    "hermes-agent>=0.13.0",
     "websockets>=12.0",
     "aiohttp>=3.9.0",
 ]

@@ -980,7 +980,11 @@ class KimiAdapter(BasePlatformAdapter):
     # ──────────────────────────────────────────────────────────────────────
 
     def __init__(self, config: PlatformConfig) -> None:
-        super().__init__(config, Platform.KIMI)
+        # Platform("kimi") creates a pseudo-member via Platform._missing_()
+        # once the registry has been populated by our register() call below.
+        # Identity-stable: Platform("kimi") is Platform("kimi"). See upstream
+        # gateway/config.py::Platform._missing_ for the mechanism.
+        super().__init__(config, Platform("kimi"))
 
         # Credentials
         self._bot_token: str = (
@@ -3677,3 +3681,200 @@ async def send_kimi_message(
                 )
     except aiohttp.ClientError as exc:
         return SendResult(success=False, error=f"network error: {exc}", retryable=True)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Plugin registration helpers (upstream ctx.register_platform API)
+# Pattern reference: upstream plugins/platforms/simplex/adapter.py
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+def validate_config(config: PlatformConfig) -> bool:
+    """Return True if a Kimi bot token is reachable (env or PlatformConfig.extra).
+
+    The registry calls this once during gateway setup-status display and again
+    before adapter instantiation. Permissive on purpose: env-var-only setups
+    must validate even when the YAML/extra path is empty.
+    """
+    if os.getenv("KIMI_BOT_TOKEN"):
+        return True
+    extra = getattr(config, "extra", {}) or {}
+    return bool(extra.get("bot_token"))
+
+
+def is_connected(config: PlatformConfig) -> bool:
+    """Return True if Kimi is configured (token present).
+
+    Used by GatewayConfig.get_connected_platforms() and the setup UI.
+    """
+    return validate_config(config)
+
+
+def _env_enablement() -> Optional[Dict[str, Any]]:
+    """Read KIMI_* env vars, return a PlatformConfig.extra seed dict.
+
+    Called during gateway startup BEFORE the adapter is constructed. Returning
+    a non-None dict marks Kimi as 'env-configured' in `hermes gateway status`
+    even when the adapter has not yet been instantiated.
+    """
+    token = os.getenv("KIMI_BOT_TOKEN")
+    if not token:
+        return None
+    extra: Dict[str, Any] = {"bot_token": token}
+    home = os.getenv("KIMI_HOME_CHANNEL")
+    if home:
+        extra["home_channel"] = home
+    return extra
+
+
+def _apply_yaml_config(
+    yaml_cfg: Dict[str, Any], platform_cfg: Dict[str, Any]
+) -> Optional[Dict[str, Any]]:
+    """Translate ``platforms.kimi.*`` config.yaml keys into ``KIMI_*`` env vars.
+
+    Env precedence is preserved via ``not os.getenv(...)`` guards — if the env
+    var is already set (e.g. from ~/.hermes/.env), the YAML value is ignored.
+    Lets Mimi-style profile configs put ``platforms.kimi.bot_token`` directly
+    in their profile ``config.yaml`` instead of needing a per-profile .env.
+
+    Called from ``gateway.config.load_gateway_config()`` after the generic
+    shared-key loop and before ``_apply_env_overrides``. Returns ``None`` —
+    we mutate env directly so the rest of the gateway sees the values
+    through the standard env-var path.
+    """
+    if not isinstance(platform_cfg, dict):
+        return None
+    _yaml_to_env = {
+        "bot_token": "KIMI_BOT_TOKEN",
+        "home_channel": "KIMI_HOME_CHANNEL",
+        "allowed_users": "KIMI_ALLOWED_USERS",
+        "allow_all_users": "KIMI_ALLOW_ALL_USERS",
+    }
+    for yaml_key, env_key in _yaml_to_env.items():
+        if yaml_key not in platform_cfg or os.getenv(env_key):
+            continue
+        value = platform_cfg[yaml_key]
+        if isinstance(value, list):
+            value = ",".join(str(item) for item in value)
+        os.environ[env_key] = str(value)
+    return None
+
+
+def interactive_setup() -> None:
+    """Minimal stdin wizard for ``hermes gateway setup`` → Kimi.
+
+    Prompts for the bot token and optional allowlist / home channel. Writes
+    via ``hermes_cli.config`` so the values land in ``~/.hermes/.env``.
+    """
+    print()
+    print("Kimi platform setup")
+    print("-------------------")
+    print("Requirements:")
+    print("  1. A Kimi bot token (km_b_prod_*) — generate via kimi.com")
+    print("     'Link existing OpenClaw' flow.")
+    print("  2. Python packages: websockets, aiohttp (already Hermes core deps).")
+    print()
+
+    try:
+        from hermes_cli.config import get_env_value, save_env_value
+    except ImportError:
+        print(
+            "hermes_cli.config not available; set KIMI_* vars manually in "
+            "~/.hermes/.env"
+        )
+        return
+
+    def _prompt(var: str, prompt_text: str, *, secret: bool = False) -> None:
+        existing = get_env_value(var) if callable(get_env_value) else None
+        suffix = " [keep current]" if existing else ""
+        try:
+            if secret:
+                import getpass
+                value = getpass.getpass(f"{prompt_text}{suffix}: ")
+            else:
+                value = input(f"{prompt_text}{suffix}: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return
+        if value:
+            save_env_value(var, value)
+
+    _prompt("KIMI_BOT_TOKEN", "Kimi bot token (km_b_prod_*)", secret=True)
+    _prompt(
+        "KIMI_ALLOWED_USERS",
+        "Allowed user UUIDs (comma-separated; blank=skip)",
+    )
+    _prompt(
+        "KIMI_HOME_CHANNEL",
+        "Home channel for cron delivery (im:kimi:main for DM, room:<uuid> for group)",
+    )
+    print("Done. Restart `hermes gateway` to apply.")
+
+
+# Inlined here rather than as a class attribute because the prompt builder
+# reads it via the registry, not from KimiAdapter directly.
+_PLATFORM_HINT = (
+    "You are chatting on Kimi (kimi.com / Moonshot AI). "
+    "Users may be on the kimi.com web app or mobile. "
+    "Direct messages arrive over a Zed ACP WebSocket — one sentinel session "
+    "per user with sessionId ``im:kimi:main``. Group rooms arrive with "
+    "chat_id ``room:<uuid>`` over a separate Connect RPC stream. User "
+    "identities are opaque UUIDs (``km_u_*``); display names may be absent. "
+    "Kimi supports standard markdown formatting. Be concise in group rooms; "
+    "verbose responses are fine in DMs."
+)
+
+_INSTALL_HINT = (
+    "Requires hermes-agent with the platform-registry API (commit 2e20f6ae2 "
+    "'plugin platform parity', merged ~Apr 11 2026). "
+    "Run: `pip install --upgrade hermes-agent` and ensure `websockets` + "
+    "`aiohttp` are available (both are already core hermes-agent deps)."
+)
+
+
+def register(ctx) -> None:
+    """Plugin entry point — called by the Hermes plugin system at startup.
+
+    Uses the upstream ``ctx.register_platform()`` API introduced by Teknium's
+    ``2e20f6ae2`` "plugin platform parity" commit. All canonical Kimi wiring
+    (env-var loading, auth env-maps, prompt hint, cron delivery, display)
+    that previously lived as in-tree patches on the fork branches now lives
+    as parameters on this single call.
+    """
+    ctx.register_platform(
+        name="kimi",
+        label="Kimi",
+        adapter_factory=lambda cfg: KimiAdapter(cfg),
+        check_fn=check_kimi_requirements,
+        validate_config=validate_config,
+        is_connected=is_connected,
+        required_env=["KIMI_BOT_TOKEN"],
+        install_hint=_INSTALL_HINT,
+        setup_fn=interactive_setup,
+        # Env-driven auto-configuration: seeds PlatformConfig.extra so
+        # env-only setups appear in `hermes gateway status` without
+        # needing to instantiate the adapter.
+        env_enablement_fn=_env_enablement,
+        # YAML→env bridge for profile configs (e.g. Mimi) that prefer
+        # `platforms.kimi.bot_token` in config.yaml over per-profile .env.
+        apply_yaml_config_fn=_apply_yaml_config,
+        # Cron home-channel delivery — `deliver=kimi` cron jobs route to
+        # KIMI_HOME_CHANNEL when set.
+        cron_deliver_env_var="KIMI_HOME_CHANNEL",
+        # NOTE: ``standalone_sender_fn`` intentionally omitted for v2.0.0.
+        # Pi gateways run cron in-process, so the live adapter weakref is
+        # always available. Add later if a future deployment splits cron
+        # from the gateway process.
+        # Auth env vars for _is_user_authorized() integration.
+        allowed_users_env="KIMI_ALLOWED_USERS",
+        allow_all_env="KIMI_ALLOW_ALL_USERS",
+        # Kimi has no hard message-length cap; we chunk for readability.
+        max_message_length=MAX_MESSAGE_LENGTH,
+        # Display.
+        emoji="🌙",  # Moonshot AI
+        # Kimi uses opaque UUIDs only — no phone numbers, no emails.
+        pii_safe=True,
+        allow_update_command=True,
+        # LLM guidance.
+        platform_hint=_PLATFORM_HINT,
+    )

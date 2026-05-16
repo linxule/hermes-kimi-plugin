@@ -1,7 +1,31 @@
-name: kimi
-version: 1.0.0
-description: "Kimi (kimi.com / Moonshot AI) chat platform adapter — DM (Zed ACP over WebSocket) + group rooms (Connect RPC over WebSocket) under one bot identity. Registers a BasePlatformAdapter via the platform-adapter registry hook."
+name: kimi-platform
+label: Kimi
+kind: platform
+version: 2.0.0
+description: >
+  Kimi (kimi.com / Moonshot AI) chat platform adapter for Hermes Agent.
+  Direct messages via Zed ACP over WebSocket (one sentinel session per user,
+  sessionId ``im:kimi:main``), group rooms via Connect RPC over WebSocket
+  (chat_id ``room:<uuid>``).  Both modes share one bot identity.
+  Registers via upstream's ``ctx.register_platform()`` API.
 author: linxule
-kind: standalone
+# ``requires_env`` / ``optional_env`` entries appear in the ``hermes config``
+# UI via the platform-plugin env var injector in ``hermes_cli/config.py``.
 requires_env:
-  - KIMI_BOT_TOKEN
+  - name: KIMI_BOT_TOKEN
+    description: "Kimi bot token (km_b_prod_*) — generate via kimi.com 'Link existing OpenClaw' flow"
+    prompt: "Kimi bot token"
+    password: true
+optional_env:
+  - name: KIMI_ALLOWED_USERS
+    description: "Comma-separated Kimi user UUIDs (km_u_*) allowed to talk to the bot"
+    prompt: "Allowed user UUIDs (comma-separated)"
+    password: false
+  - name: KIMI_ALLOW_ALL_USERS
+    description: "Allow any user to talk to the bot (dev only — disables allowlist)"
+    prompt: "Allow all users? (true/false)"
+    password: false
+  - name: KIMI_HOME_CHANNEL
+    description: "Default room for cron / notification delivery (``im:kimi:main`` for DM, ``room:<uuid>`` for group)"
+    prompt: "Home channel room ID (or empty)"
+    password: false
