@@ -3627,7 +3627,17 @@ async def send_kimi_message(
             error="Kimi: standalone send supports only group rooms",
             retryable=False,
         )
-    token = config.token or config.extra.get("bot_token") or os.getenv("KIMI_BOT_TOKEN", "")
+    # Mirror the ``__init__`` chain so the standalone send path (used by
+    # cron delivery and ``send_message_tool`` when no live adapter exists)
+    # resolves ``${KIMI_BOT_TOKEN}`` literals the same way the live adapter
+    # does. Without this, a config.yaml of the form
+    # ``platforms.kimi.token: ${KIMI_BOT_TOKEN}`` would 401 silently on
+    # cron-driven kimi deliveries while the live bot path worked fine.
+    token = (
+        _resolve_env_template(config.token)
+        or _resolve_env_template(config.extra.get("bot_token", ""))
+        or os.getenv("KIMI_BOT_TOKEN", "")
+    )
     if not token:
         return SendResult(success=False, error="Kimi: no bot_token configured", retryable=False)
     base_url = config.extra.get("base_url", _DEFAULT_BASE_URL).rstrip("/")

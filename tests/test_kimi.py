@@ -13,6 +13,7 @@ import logging
 import os
 import struct
 import unittest
+import uuid
 from collections import deque
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -41,6 +42,7 @@ from kimi_adapter import (
     _split_for_streaming,
     _ulid_time_ms,
     check_kimi_requirements,
+    send_kimi_message,
 )
 from gateway.session import SessionSource
 
@@ -182,18 +184,111 @@ class AdapterTokenResolutionTests(unittest.TestCase):
     """End-to-end: the adapter ``__init__`` resolves ``${KIMI_BOT_TOKEN}``
     in ``config.token`` from the env, not literally."""
 
+    # The unique sentinel below is what the test SHOULD see if the resolver
+    # actually ran.  If we just asserted on a generic value like
+    # ``"km_b_prod_RESOLVED_TOKEN"`` and the dev's shell happened to export
+    # ``KIMI_BOT_TOKEN`` with that exact value, the assertion would pass
+    # even if ``_resolve_env_template`` were broken.  A UUID-derived
+    # sentinel makes that vanishingly unlikely.
+    _SENTINEL = "km_b_prod_TEST_SENTINEL_" + uuid.uuid4().hex
+
     def test_template_in_config_token_resolves_from_env(self):
-        cfg = PlatformConfig(
-            enabled=True,
-            token="${KIMI_BOT_TOKEN}",  # the bug pattern
-            extra={"enable_dms": True, "enable_groups": False},
-        )
-        with patch.dict(
-            os.environ, {"KIMI_BOT_TOKEN": "km_b_prod_RESOLVED_TOKEN"}, clear=False
-        ):
-            adapter = KimiAdapter(cfg)
-        self.assertEqual(adapter._bot_token, "km_b_prod_RESOLVED_TOKEN")
-        self.assertNotIn("${", adapter._bot_token)
+        # Pop any pre-existing KIMI_BOT_TOKEN from the shell so the
+        # ``patch.dict(..., clear=False)`` block is what's actually
+        # being asserted against, not a leaky shell var.
+        prior = os.environ.pop("KIMI_BOT_TOKEN", None)
+        try:
+            cfg = PlatformConfig(
+                enabled=True,
+                token="${KIMI_BOT_TOKEN}",  # the bug pattern
+                extra={"enable_dms": True, "enable_groups": False},
+            )
+            with patch.dict(
+                os.environ, {"KIMI_BOT_TOKEN": self._SENTINEL}, clear=False
+            ):
+                adapter = KimiAdapter(cfg)
+            self.assertEqual(adapter._bot_token, self._SENTINEL)
+            self.assertNotIn("${", adapter._bot_token)
+        finally:
+            if prior is not None:
+                os.environ["KIMI_BOT_TOKEN"] = prior
+
+
+class StandaloneSendTokenResolutionTests(unittest.TestCase):
+    """Regression test for the 2026-05-16 v2.0.1 fix.
+
+    The standalone ``send_kimi_message`` helper (used by cron delivery and
+    ``send_message_tool`` when no live adapter is available) shares the
+    same bot-token resolution surface as ``KimiAdapter.__init__``.  The
+    v2.0.0 fix wrapped ``__init__`` only, so a ``token: ${KIMI_BOT_TOKEN}``
+    config.yaml line would 401 silently on every cron-driven kimi
+    delivery while the live bot path worked fine.  These tests verify the
+    helper now resolves the template before reaching ``_runtime_headers``.
+    """
+
+    _SENTINEL = "km_b_prod_STANDALONE_SENTINEL_" + uuid.uuid4().hex
+
+    def test_template_in_config_token_resolves_for_standalone_send(self):
+        prior = os.environ.pop("KIMI_BOT_TOKEN", None)
+        try:
+            cfg = PlatformConfig(
+                enabled=True,
+                token="${KIMI_BOT_TOKEN}",  # the bug pattern
+                extra={"enable_groups": True},
+            )
+            with patch.dict(
+                os.environ, {"KIMI_BOT_TOKEN": self._SENTINEL}, clear=False
+            ):
+                # Mock _runtime_headers to capture the bot_token it
+                # receives, then short-circuit the rest of the send by
+                # making the aiohttp POST raise — we don't care what
+                # happens after token resolution.
+                with patch("kimi_adapter._runtime_headers") as mock_headers:
+                    mock_headers.return_value = {}
+                    with patch("kimi_adapter.aiohttp.ClientSession") as mock_session:
+                        mock_session.side_effect = RuntimeError("short-circuit")
+                        try:
+                            asyncio.run(
+                                send_kimi_message(
+                                    cfg,
+                                    chat_id="room:test-room-id",
+                                    text="hello",
+                                )
+                            )
+                        except RuntimeError:
+                            pass  # expected
+            mock_headers.assert_called_once()
+            kwargs = mock_headers.call_args.kwargs
+            self.assertEqual(kwargs["bot_token"], self._SENTINEL)
+            self.assertNotIn("${", kwargs["bot_token"])
+        finally:
+            if prior is not None:
+                os.environ["KIMI_BOT_TOKEN"] = prior
+
+    def test_unresolved_template_yields_no_token_error(self):
+        # When KIMI_BOT_TOKEN is unset, the template resolves to empty
+        # string, and the empty-token guard should fire BEFORE any HTTP
+        # call. We must not send a literal "${KIMI_BOT_TOKEN}" to kimi.
+        prior = os.environ.pop("KIMI_BOT_TOKEN", None)
+        try:
+            cfg = PlatformConfig(
+                enabled=True,
+                token="${KIMI_BOT_TOKEN}",
+                extra={"enable_groups": True},
+            )
+            result = asyncio.run(
+                send_kimi_message(
+                    cfg,
+                    chat_id="room:test-room-id",
+                    text="hello",
+                )
+            )
+            self.assertFalse(result.success)
+            self.assertIn("no bot_token configured", result.error)
+            self.assertNotIn("${", result.error)  # nothing template-shaped leaked
+        finally:
+            if prior is not None:
+                os.environ["KIMI_BOT_TOKEN"] = prior
 
 
 class AdapterInitTests(unittest.TestCase):
