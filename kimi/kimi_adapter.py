@@ -3867,6 +3867,29 @@ async def send_kimi_message(
                     message_id=data.get("message_id") or data.get("messageId"),
                     raw_response=data,
                 )
+    except asyncio.TimeoutError:
+        # Mirrors the live-adapter v2.1.4 fix at line ~1807.  Standalone path
+        # also hits the kimi.com response-hang phenomenon (per-connection
+        # server-side response held past 30s while concurrent requests succeed
+        # in <1s).  Without this clause, bare asyncio.TimeoutError propagates
+        # uncaught through _standalone_send and any retry layer above can
+        # double-deliver — the same duplicate-send bug v2.1.4 fixed for the
+        # live arm.  Return retryable=False so cron / send_message_tool don't
+        # re-POST the same body.
+        logger.warning(
+            "Kimi: standalone SendMessage to %s timed out after %.1fs at the client; "
+            "kimi.com may still have accepted the message internally. "
+            "Marking non-retryable to avoid duplicate delivery.",
+            chat_id, _RPC_TIMEOUT_S,
+        )
+        return SendResult(
+            success=False,
+            error=(
+                f"Kimi: send timed out after {_RPC_TIMEOUT_S:.0f}s "
+                "(message may have been delivered server-side; not retrying)"
+            ),
+            retryable=False,
+        )
     except aiohttp.ClientError as exc:
         return SendResult(success=False, error=f"network error: {exc}", retryable=True)
 

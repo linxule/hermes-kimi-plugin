@@ -364,6 +364,109 @@ class StandaloneSendRegistryWrapperTests(unittest.TestCase):
         )
 
 
+class SendKimiMessageStandalonePolicyTests(unittest.IsolatedAsyncioTestCase):
+    """v2.1.5 regression coverage for the standalone send path's timeout policy.
+
+    v2.1.4 marked ``asyncio.TimeoutError`` non-retryable in the live
+    ``send()`` arm, but the standalone ``send_kimi_message`` helper (used by
+    cron delivery and by ``send_message_tool`` when no live adapter is
+    available) only caught ``aiohttp.ClientError``.  Bare TimeoutError
+    propagated uncaught, so cron-driven Kimi sends could still duplicate
+    via any retry layer that interpreted the absent ``retryable`` field as
+    "retry".  v2.1.5 adds ``except asyncio.TimeoutError`` ahead of the
+    existing ``except aiohttp.ClientError`` clause.
+    """
+
+    async def test_standalone_timeout_returns_non_retryable(self):
+        cfg = PlatformConfig(
+            enabled=True,
+            token="km_b_prod_STANDALONE_TIMEOUT_TEST",
+            extra={"enable_groups": True},
+        )
+
+        # Patch aiohttp.ClientSession so session.post(...) raises
+        # asyncio.TimeoutError — the exact failure mode the v2.1.5 except
+        # clause catches.
+        class _TimeoutPostCtx:
+            async def __aenter__(self_inner):
+                raise asyncio.TimeoutError()
+
+            async def __aexit__(self_inner, *exc):
+                return False
+
+        fake_session = MagicMock()
+        fake_session.post = MagicMock(return_value=_TimeoutPostCtx())
+
+        class _FakeSessionFactory:
+            async def __aenter__(self_inner):
+                return fake_session
+
+            async def __aexit__(self_inner, *exc):
+                return False
+
+        with patch(
+            "kimi_adapter.aiohttp.ClientSession",
+            return_value=_FakeSessionFactory(),
+        ):
+            with self.assertLogs("kimi_adapter", level="WARNING") as cm:
+                result = await send_kimi_message(
+                    cfg,
+                    chat_id="room:test-timeout-uuid",
+                    text="hello",
+                )
+
+        self.assertFalse(result.success)
+        self.assertFalse(result.retryable)
+        self.assertIn("timed out", result.error)
+        warning_text = "\n".join(cm.output)
+        self.assertIn("room:test-timeout-uuid", warning_text)
+        self.assertIn("Marking non-retryable", warning_text)
+        # Mirror the live-arm message phrasing for cross-arm consistency.
+        self.assertIn("standalone SendMessage", warning_text)
+
+    async def test_standalone_network_error_remains_retryable(self):
+        # ClientError (genuine network failure) should still be retryable —
+        # only TimeoutError gets the non-retryable treatment.
+        import aiohttp as _aiohttp  # local import; not in top-level test imports
+
+        cfg = PlatformConfig(
+            enabled=True,
+            token="km_b_prod_STANDALONE_NETERR_TEST",
+            extra={"enable_groups": True},
+        )
+
+        class _NetErrPostCtx:
+            async def __aenter__(self_inner):
+                raise _aiohttp.ClientError("simulated network drop")
+
+            async def __aexit__(self_inner, *exc):
+                return False
+
+        fake_session = MagicMock()
+        fake_session.post = MagicMock(return_value=_NetErrPostCtx())
+
+        class _FakeSessionFactory:
+            async def __aenter__(self_inner):
+                return fake_session
+
+            async def __aexit__(self_inner, *exc):
+                return False
+
+        with patch(
+            "kimi_adapter.aiohttp.ClientSession",
+            return_value=_FakeSessionFactory(),
+        ):
+            result = await send_kimi_message(
+                cfg,
+                chat_id="room:test-neterr-uuid",
+                text="hello",
+            )
+
+        self.assertFalse(result.success)
+        self.assertTrue(result.retryable)
+        self.assertIn("network error", result.error)
+
+
 class CrossLoopSessionTests(unittest.TestCase):
     """Regression coverage for the cross-loop aiohttp ``ClientSession`` bug.
 

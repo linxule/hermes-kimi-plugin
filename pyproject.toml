@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "hermes-kimi-plugin"
-version = "2.1.4"
+version = "2.1.5"
 description = "Kimi (kimi.com / Moonshot AI) chat platform adapter for Hermes Agent — DM + group rooms under one bot identity. Uses upstream ctx.register_platform() API."
 readme = "README.md"
 requires-python = ">=3.11"
