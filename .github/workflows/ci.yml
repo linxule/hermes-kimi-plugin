@@ -98,6 +98,19 @@ jobs:
           class StubCtx:
               def register_platform(self, **kwargs):
                   recorded.update(kwargs)
+                  # Mirror the real PluginContext side effect enough for the
+                  # adapter_factory smoke below: KimiAdapter.__init__ calls
+                  # Platform("kimi"), which only resolves after registry
+                  # population.
+                  from gateway.platform_registry import PlatformEntry, platform_registry
+                  platform_registry.register(PlatformEntry(
+                      name=kwargs['name'],
+                      label=kwargs['label'],
+                      adapter_factory=kwargs['adapter_factory'],
+                      check_fn=kwargs['check_fn'],
+                      validate_config=kwargs.get('validate_config'),
+                      source='plugin',
+                  ))
 
           mod.register(StubCtx())
 
@@ -112,6 +125,7 @@ jobs:
           assert callable(recorded.get('check_fn'))
           assert callable(recorded.get('apply_yaml_config_fn'))
           assert callable(recorded.get('env_enablement_fn'))
+          assert callable(recorded.get('standalone_sender_fn'))
 
           # Verify the adapter_factory actually constructs a KimiAdapter
           # against a minimal PlatformConfig — catches constructor regressions.

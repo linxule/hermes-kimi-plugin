@@ -12,9 +12,11 @@ import json
 import logging
 import os
 import struct
+import tempfile
 import unittest
 import uuid
 from collections import deque
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -41,6 +43,7 @@ from kimi_adapter import (
     _parse_iso8601,
     _split_for_streaming,
     _ulid_time_ms,
+    _standalone_send,
     check_kimi_requirements,
     send_kimi_message,
 )
@@ -289,6 +292,76 @@ class StandaloneSendTokenResolutionTests(unittest.TestCase):
         finally:
             if prior is not None:
                 os.environ["KIMI_BOT_TOKEN"] = prior
+
+
+class StandaloneSendRegistryWrapperTests(unittest.TestCase):
+    """The registered standalone_sender_fn wrapper matches upstream's contract."""
+
+    def test_success_result_converts_to_send_message_tool_dict(self):
+        cfg = PlatformConfig(enabled=True, token="tok", extra={})
+        with patch(
+            "kimi_adapter.send_kimi_message",
+            new=AsyncMock(return_value=SendResult(success=True, message_id="msg-123")),
+        ) as mock_send:
+            result = asyncio.run(
+                _standalone_send(
+                    cfg,
+                    "room:abc",
+                    "hello",
+                    thread_id="thread-1",
+                    media_files=["/tmp/a.png"],
+                )
+            )
+
+        self.assertEqual(result, {"success": True, "message_id": "msg-123"})
+        mock_send.assert_awaited_once_with(
+            cfg,
+            "room:abc",
+            "hello",
+            thread_id="thread-1",
+            media_paths=["/tmp/a.png"],
+        )
+
+    def test_failure_result_converts_to_error_dict(self):
+        cfg = PlatformConfig(enabled=True, token="tok", extra={})
+        with patch(
+            "kimi_adapter.send_kimi_message",
+            new=AsyncMock(
+                return_value=SendResult(
+                    success=False,
+                    error="network error",
+                    retryable=True,
+                )
+            ),
+        ):
+            result = asyncio.run(_standalone_send(cfg, "room:abc", "hello"))
+
+        self.assertEqual(result, {"error": "network error", "retryable": True})
+
+    def test_force_document_is_accepted_but_ignored(self):
+        cfg = PlatformConfig(enabled=True, token="tok", extra={})
+        with patch(
+            "kimi_adapter.send_kimi_message",
+            new=AsyncMock(return_value=SendResult(success=True)),
+        ) as mock_send:
+            result = asyncio.run(
+                _standalone_send(
+                    cfg,
+                    "room:abc",
+                    "hello",
+                    media_files=["/tmp/a.pdf"],
+                    force_document=True,
+                )
+            )
+
+        self.assertEqual(result, {"success": True})
+        mock_send.assert_awaited_once_with(
+            cfg,
+            "room:abc",
+            "hello",
+            thread_id=None,
+            media_paths=["/tmp/a.pdf"],
+        )
 
 
 class AdapterInitTests(unittest.TestCase):
@@ -1483,9 +1556,13 @@ class ConfigIntegrationTests(unittest.TestCase):
         with patch.dict(os.environ, {
             "KIMI_BOT_TOKEN": "tok",
             "KIMI_HOME_CHANNEL": "im:kimi:main",
+            "KIMI_HOME_CHANNEL_NAME": "Kimi Home",
         }, clear=False):
             result = _env_enablement()
-        self.assertEqual(result["home_channel"], "im:kimi:main")
+        self.assertEqual(
+            result["home_channel"],
+            {"chat_id": "im:kimi:main", "name": "Kimi Home"},
+        )
 
     def test_apply_yaml_config_populates_env(self):
         from kimi_adapter import _apply_yaml_config
@@ -1512,6 +1589,126 @@ class ConfigIntegrationTests(unittest.TestCase):
         # platform_cfg can be None or a non-dict when the YAML key is absent
         self.assertIsNone(_apply_yaml_config({}, None))
         self.assertIsNone(_apply_yaml_config({}, "not a dict"))
+
+    def test_load_gateway_config_top_level_kimi_yaml_bridge_seeds_env_and_extra(self):
+        from gateway.config import Platform, load_gateway_config
+        from gateway.platform_registry import PlatformEntry, platform_registry
+        from kimi_adapter import _apply_yaml_config, _env_enablement
+
+        previous = platform_registry.get("kimi")
+        platform_registry.unregister("kimi")
+        platform_registry.register(PlatformEntry(
+            name="kimi",
+            label="Kimi",
+            adapter_factory=lambda cfg: None,
+            check_fn=lambda: bool(os.getenv("KIMI_BOT_TOKEN")),
+            source="plugin",
+            apply_yaml_config_fn=_apply_yaml_config,
+            env_enablement_fn=_env_enablement,
+        ))
+        old_home = os.environ.get("HERMES_HOME")
+        env_no_kimi = {k: v for k, v in os.environ.items() if not k.startswith("KIMI_")}
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                home = Path(tmp) / ".hermes"
+                home.mkdir()
+                (home / "config.yaml").write_text(
+                    "kimi:\n"
+                    "  bot_token: km_b_prod_FROM_TOP_LEVEL\n"
+                    "  home_channel: room:home\n",
+                    encoding="utf-8",
+                )
+                with patch.dict(os.environ, env_no_kimi, clear=True):
+                    os.environ["HERMES_HOME"] = str(home)
+                    cfg = load_gateway_config()
+
+                    self.assertEqual(
+                        os.environ.get("KIMI_BOT_TOKEN"),
+                        "km_b_prod_FROM_TOP_LEVEL",
+                    )
+                    platform = Platform("kimi")
+                    self.assertIn(platform, cfg.platforms)
+                    self.assertEqual(
+                        cfg.platforms[platform].extra.get("bot_token"),
+                        "km_b_prod_FROM_TOP_LEVEL",
+                    )
+                    self.assertIsNotNone(cfg.platforms[platform].home_channel)
+                    self.assertEqual(
+                        cfg.platforms[platform].home_channel.chat_id,
+                        "room:home",
+                    )
+        finally:
+            platform_registry.unregister("kimi")
+            if previous is not None:
+                platform_registry.register(previous)
+            if old_home is None:
+                os.environ.pop("HERMES_HOME", None)
+            else:
+                os.environ["HERMES_HOME"] = old_home
+
+    def test_platforms_extra_template_remains_raw_but_runtime_paths_resolve(self):
+        from gateway.config import Platform, load_gateway_config
+        from gateway.platform_registry import PlatformEntry, platform_registry
+
+        previous = platform_registry.get("kimi")
+        platform_registry.unregister("kimi")
+        platform_registry.register(PlatformEntry(
+            name="kimi",
+            label="Kimi",
+            adapter_factory=lambda cfg: None,
+            check_fn=lambda: True,
+            source="plugin",
+        ))
+        old_home = os.environ.get("HERMES_HOME")
+        sentinel = "km_b_prod_RAW_EXTRA_" + uuid.uuid4().hex
+        env_no_kimi = {k: v for k, v in os.environ.items() if not k.startswith("KIMI_")}
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                home = Path(tmp) / ".hermes"
+                home.mkdir()
+                (home / "config.yaml").write_text(
+                    "platforms:\n"
+                    "  kimi:\n"
+                    "    enabled: true\n"
+                    "    extra:\n"
+                    "      bot_token: ${KIMI_BOT_TOKEN}\n",
+                    encoding="utf-8",
+                )
+                with patch.dict(os.environ, env_no_kimi, clear=True):
+                    os.environ["HERMES_HOME"] = str(home)
+                    os.environ["KIMI_BOT_TOKEN"] = sentinel
+                    cfg = load_gateway_config()
+
+                    platform = Platform("kimi")
+                    pconfig = cfg.platforms[platform]
+                    self.assertEqual(
+                        pconfig.extra.get("bot_token"),
+                        "${KIMI_BOT_TOKEN}",
+                    )
+                    adapter = KimiAdapter(pconfig)
+                    self.assertEqual(adapter._bot_token, sentinel)
+                    with patch(
+                        "kimi_adapter.send_kimi_message",
+                        new=AsyncMock(return_value=SendResult(success=True)),
+                    ) as mock_send:
+                        result = asyncio.run(
+                            _standalone_send(pconfig, "room:abc", "hello")
+                        )
+
+                    self.assertEqual(result, {"success": True})
+                    forwarded_cfg = mock_send.await_args.args[0]
+                    self.assertEqual(
+                        _resolve_env_template(forwarded_cfg.extra["bot_token"]),
+                        sentinel,
+                    )
+        finally:
+            platform_registry.unregister("kimi")
+            if previous is not None:
+                platform_registry.register(previous)
+            if old_home is None:
+                os.environ.pop("HERMES_HOME", None)
+            else:
+                os.environ["HERMES_HOME"] = old_home
 
 
 class UserIdentityExtractionTests(unittest.TestCase):
@@ -4325,6 +4522,7 @@ class PluginRegistrationTests(unittest.TestCase):
         self.assertTrue(callable(kwargs["is_connected"]))
         self.assertTrue(callable(kwargs["env_enablement_fn"]))
         self.assertTrue(callable(kwargs["apply_yaml_config_fn"]))
+        self.assertTrue(callable(kwargs["standalone_sender_fn"]))
         self.assertTrue(callable(kwargs["setup_fn"]))
 
         # Platform hint mentions Kimi explicitly.

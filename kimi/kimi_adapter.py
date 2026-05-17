@@ -3735,6 +3735,35 @@ async def send_kimi_message(
         return SendResult(success=False, error=f"network error: {exc}", retryable=True)
 
 
+async def _standalone_send(
+    pconfig: PlatformConfig,
+    chat_id: str,
+    message: str,
+    *,
+    thread_id: Optional[str] = None,
+    media_files: Optional[List[str]] = None,
+    force_document: bool = False,
+) -> Dict[str, Any]:
+    """Registry wrapper for out-of-process ``send_message_tool`` / cron sends."""
+    _ = force_document  # Kimi has no document-vs-native attachment split.
+    result = await send_kimi_message(
+        pconfig,
+        chat_id,
+        message,
+        thread_id=thread_id,
+        media_paths=media_files,
+    )
+    if result.success:
+        payload: Dict[str, Any] = {"success": True}
+        if result.message_id:
+            payload["message_id"] = result.message_id
+        return payload
+    return {
+        "error": result.error or "Kimi standalone send failed",
+        "retryable": result.retryable,
+    }
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Plugin registration helpers (upstream ctx.register_platform API)
 # Pattern reference: upstream plugins/platforms/simplex/adapter.py
@@ -3775,19 +3804,22 @@ def _env_enablement() -> Optional[Dict[str, Any]]:
     extra: Dict[str, Any] = {"bot_token": token}
     home = os.getenv("KIMI_HOME_CHANNEL")
     if home:
-        extra["home_channel"] = home
+        extra["home_channel"] = {
+            "chat_id": home,
+            "name": os.getenv("KIMI_HOME_CHANNEL_NAME", "Home"),
+        }
     return extra
 
 
 def _apply_yaml_config(
     yaml_cfg: Dict[str, Any], platform_cfg: Dict[str, Any]
 ) -> Optional[Dict[str, Any]]:
-    """Translate ``platforms.kimi.*`` config.yaml keys into ``KIMI_*`` env vars.
+    """Translate top-level ``kimi:`` config.yaml keys into ``KIMI_*`` env vars.
 
     Env precedence is preserved via ``not os.getenv(...)`` guards — if the env
     var is already set (e.g. from ~/.hermes/.env), the YAML value is ignored.
-    Lets Mimi-style profile configs put ``platforms.kimi.bot_token`` directly
-    in their profile ``config.yaml`` instead of needing a per-profile .env.
+    Lets Mimi-style profile configs put a top-level ``kimi:`` block directly in
+    their profile ``config.yaml`` instead of needing a per-profile .env.
 
     Called from ``gateway.config.load_gateway_config()`` after the generic
     shared-key loop and before ``_apply_env_overrides``. Returns ``None`` —
@@ -3908,15 +3940,13 @@ def register(ctx) -> None:
         # needing to instantiate the adapter.
         env_enablement_fn=_env_enablement,
         # YAML→env bridge for profile configs (e.g. Mimi) that prefer
-        # `platforms.kimi.bot_token` in config.yaml over per-profile .env.
+        # a top-level `kimi:` block in config.yaml over per-profile .env.
         apply_yaml_config_fn=_apply_yaml_config,
         # Cron home-channel delivery — `deliver=kimi` cron jobs route to
         # KIMI_HOME_CHANNEL when set.
         cron_deliver_env_var="KIMI_HOME_CHANNEL",
-        # NOTE: ``standalone_sender_fn`` intentionally omitted for v2.0.0.
-        # Pi gateways run cron in-process, so the live adapter weakref is
-        # always available. Add later if a future deployment splits cron
-        # from the gateway process.
+        # Out-of-process cron / send_message delivery for group rooms.
+        standalone_sender_fn=_standalone_send,
         # Auth env vars for _is_user_authorized() integration.
         allowed_users_env="KIMI_ALLOWED_USERS",
         allow_all_env="KIMI_ALLOW_ALL_USERS",

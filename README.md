@@ -66,18 +66,38 @@ plugins:
 platforms:
   kimi:
     enabled: true
-    # Optional Kimi-specific settings — see kimi_adapter.py for the full shape.
+    # Optional raw PlatformConfig.extra values. Hermes passes these through
+    # without ${VAR} expansion; the adapter defensively resolves full
+    # ${KIMI_BOT_TOKEN} literals in token fields at runtime.
+    extra:
+      bot_token: ${KIMI_BOT_TOKEN}
+      # See kimi_adapter.py for the full shape.
     # Defaults are tuned for Bloom's Pi deployment:
     #   home_channel: nag-once-per-session
     #   subscribe_backoff: 2s → 60s exponential
     #   reconnect_strategy: exponential with jitter
 ```
 
-Add to `$HERMES_HOME/.env`:
+For env-first setups, add to `$HERMES_HOME/.env`:
 
 ```
 KIMI_BOT_TOKEN=km_b_prod_<your_token>
 ```
+
+For profile configs that should avoid a per-profile `.env`, use the plugin's
+top-level YAML bridge instead:
+
+```yaml
+kimi:
+  bot_token: km_b_prod_<your_token>
+  home_channel: room:<uuid>
+  allowed_users:
+    - km_u_<uuid>
+```
+
+Hermes calls the bridge with `config.yaml`'s top-level `kimi:` block. It does
+not call the bridge for `platforms.kimi.extra`; those values arrive as raw
+`PlatformConfig.extra` data.
 
 Restart the Hermes gateway. On boot you should see a log line like:
 
