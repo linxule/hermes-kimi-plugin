@@ -1097,13 +1097,31 @@ class KimiAdapter(BasePlatformAdapter):
         # silently swallows DM traffic without an exempt list. Accepts both keys
         # for cross-platform familiarity; `kimi_free_response_chats` is the
         # documented name, the other is an alias.
+        #
+        # Wire shape note: `_on_group_event` reads `chatId` directly from the
+        # subscribe-stream envelope, where it arrives as a raw UUID with no
+        # `room:` prefix.  Gateway-side identifiers (KIMI_HOME_CHANNEL,
+        # /sethome output, `Session.chat_id` after handler enrichment) all
+        # carry the `room:` prefix.  Users naturally copy-paste the prefixed
+        # form from those surfaces.  We normalise the set entries to the raw
+        # UUID shape that the gate's `chat_id` actually carries, so a config
+        # of `room:<uuid>` and a wire frame with `chatId=<uuid>` correctly
+        # compare equal.  Both formats are accepted on input.
         _exempt_raw = (
             config.extra.get("kimi_free_response_chats")
             or config.extra.get("group_require_mention_exempt_rooms")
             or []
         )
+
+        def _normalise_exempt_entry(value: object) -> Optional[str]:
+            if not isinstance(value, str) or not value:
+                return None
+            return value[len("room:"):] if value.startswith("room:") else value
+
         self._group_require_mention_exempt_rooms: frozenset[str] = frozenset(
-            str(r) for r in _exempt_raw if isinstance(r, str) and r
+            normalised
+            for normalised in (_normalise_exempt_entry(r) for r in _exempt_raw)
+            if normalised
         )
 
         # Short_id / id allowlist — authoritative identity-based bypass of role filter

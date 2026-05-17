@@ -1407,37 +1407,59 @@ class MentionGateExemptionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(adapter._group_require_mention_exempt_rooms, frozenset())
 
     def test_exempt_list_loaded_from_config(self):
+        # Mixed prefixed + raw entries: both normalise to the raw UUID form
+        # so they can compare against `chatId` from the subscribe stream.
+        # Regression for v2.1.2 deploy bug: README documents the prefixed
+        # form (matching KIMI_HOME_CHANNEL convention), but `_on_group_event`
+        # extracts `chatId` from the wire envelope as a raw UUID — the v2.1.2
+        # gate silently never fired because the set held prefixed strings
+        # that never equalled the wire's raw form.
         adapter = KimiAdapter(_cfg(
             group_require_mention=True,
-            kimi_free_response_chats=["room:aaa", "room:bbb"],
+            kimi_free_response_chats=["room:aaa", "bbb"],
         ))
         self.assertEqual(
             adapter._group_require_mention_exempt_rooms,
-            frozenset({"room:aaa", "room:bbb"}),
+            frozenset({"aaa", "bbb"}),
+        )
+
+    def test_exempt_entries_strip_room_prefix(self):
+        # All-prefixed config (the README-documented form) must still match
+        # raw-UUID chat_ids from the wire after normalisation.
+        adapter = KimiAdapter(_cfg(
+            group_require_mention=True,
+            kimi_free_response_chats=[
+                "room:19e31a29-4722-8804-8000-094a7731741b",
+            ],
+        ))
+        self.assertEqual(
+            adapter._group_require_mention_exempt_rooms,
+            frozenset({"19e31a29-4722-8804-8000-094a7731741b"}),
         )
 
     def test_alias_key_recognized(self):
         # group_require_mention_exempt_rooms is accepted as an alias for the
         # documented kimi_free_response_chats key. Useful for users coming
-        # from the explicit name.
+        # from the explicit name. Normalisation applies to the alias too.
         adapter = KimiAdapter(_cfg(
             group_require_mention=True,
             group_require_mention_exempt_rooms=["room:zzz"],
         ))
         self.assertEqual(
             adapter._group_require_mention_exempt_rooms,
-            frozenset({"room:zzz"}),
+            frozenset({"zzz"}),
         )
 
     def test_non_string_entries_filtered(self):
         # Be tolerant of YAML-side garbage (None, ints, empty strings).
+        # Normalisation runs after the type filter; survivors land prefix-free.
         adapter = KimiAdapter(_cfg(
             group_require_mention=True,
-            kimi_free_response_chats=["room:ok", "", None, 42, "room:also-ok"],
+            kimi_free_response_chats=["room:ok", "", None, 42, "also-ok"],
         ))
         self.assertEqual(
             adapter._group_require_mention_exempt_rooms,
-            frozenset({"room:ok", "room:also-ok"}),
+            frozenset({"ok", "also-ok"}),
         )
 
     async def test_exempt_room_bypasses_mention_gate(self):
