@@ -1,7 +1,7 @@
 name: kimi
 label: Kimi
 kind: platform
-version: 2.0.1
+version: 2.1.0
 description: >
   Kimi (kimi.com / Moonshot AI) chat platform adapter for Hermes Agent.
   Direct messages via Zed ACP over WebSocket (one sentinel session per user,
