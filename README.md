@@ -112,6 +112,65 @@ INFO hermes_plugins.kimi.kimi_adapter: Kimi: connected as <bot-name>
 
 If you don't see the `registered platform: kimi` line, the loader didn't pick up the plugin — check that the symlink at `$HERMES_HOME/plugins/kimi` resolves to this repo's `kimi/` subdirectory and that `plugins.enabled: [- kimi]` is set in `config.yaml`.
 
+### Home channel (optional)
+
+Hermes models a **home channel per platform**. Each platform you connect has its own, independent of the others — Telegram's home doesn't affect Kimi's, Discord's doesn't affect either. Setting `/sethome` in one platform does not propagate to another.
+
+For Kimi specifically, the home channel is **optional**. The platform works fully without one — direct conversation (inbound messages + agent replies) doesn't consult the home channel at all. What you gain by setting one:
+
+| Trigger | Effect with `KIMI_HOME_CHANNEL` set | Effect without it |
+|---|---|---|
+| User-driven `/restart` slash command | Posts `♻️ Gateway online — Hermes is back and ready.` to the home channel after the gateway reboots | No Kimi-side notification (Telegram / Discord still notify if they have their own homes) |
+| Gateway shutdown | Posts shutdown notice to the home channel | No Kimi-side notification |
+| Cron job with `deliver: kimi` and no explicit `chat_id` | Routes to the home channel | Cron job's Kimi delivery fails (you need either a home or an explicit target) |
+| Anything calling `get_home_channel(Platform("kimi"))` | Returns the configured `HomeChannel` dataclass | Returns `None` |
+
+#### Two ways to set it
+
+```bash
+# Option 1: env var (set once, persists across restarts)
+echo 'KIMI_BOT_TOKEN=km_b_prod_...' >> $HERMES_HOME/.env
+echo 'KIMI_HOME_CHANNEL=room:<uuid>' >> $HERMES_HOME/.env
+```
+
+```
+# Option 2: /sethome slash command, run from inside the target Kimi chat
+/sethome
+```
+
+Both end up writing the same `KIMI_HOME_CHANNEL=...` line to `$HERMES_HOME/.env`. The slash command path is preferred because it pulls the current `chat_id` from the message context — no manual UUID copying.
+
+#### Format of the chat_id
+
+Kimi's wire model wraps **every** conversation behind a `room:<uuid>` prefix, including your 1:1 chat with the bot. There is no separate "DM" identifier shape for user↔bot conversations on Kimi — the 1:1 is structurally a 2-person room from kimi.com's perspective.
+
+So a valid `KIMI_HOME_CHANNEL` looks like:
+
+```
+KIMI_HOME_CHANNEL=room:19e31a29-4722-8804-8000-094a7731741b
+```
+
+The UUID is owned by kimi.com — get it from your gateway's `inbound message` log line for the target chat (`chat=room:<uuid>`), or rely on `/sethome` to pick it up for you.
+
+### ⚠️ Bot identity rotation invalidates the home channel
+
+The room UUIDs kimi.com assigns to a 1:1 conversation are **derived from the bot's identity** (same UUIDv7 timestamp + identity bits as the bot's user UUID). When the bot's identity rotates — typically because you regenerated the bot token via kimi.com's "Connected Apps → Generate token" flow, or because the underlying claw runtime cycled the bot's user account — kimi.com starts a **new** 1:1 room for the new bot, with a new UUID.
+
+`KIMI_HOME_CHANNEL` in `.env` is **not** automatically updated when this happens. The env var keeps pointing at the old room, which the new bot identity has no membership in. Symptoms:
+
+- Restart / shutdown notifications go to a room nobody is in (silent void; no error visible in logs because the send succeeds at the API level)
+- Cron deliveries with `deliver: kimi` look like they succeeded (HTTP 200 from kimi.com) but the recipient sees nothing
+- The first hint is usually a user noticing they stopped seeing gateway-status pings
+
+**Diagnose** by comparing the bot's `id=...` in the `Kimi: connected as ...` log line against the UUID stem in `KIMI_HOME_CHANNEL`. If the first segment differs (e.g. bot reports `id=19e31a29-...` but the home channel says `room:19dbb6a7-...`), the home channel is stale.
+
+**Recover** by either:
+
+1. Running `/sethome` from inside the live 1:1 DM with the new bot identity (recommended — the new chat_id gets written to `.env` automatically), OR
+2. Unsetting `KIMI_HOME_CHANNEL` entirely if you don't need a Kimi-side home (`sed -i '/^KIMI_HOME_CHANNEL=/d' $HERMES_HOME/.env`), then restarting the gateway.
+
+Either way, restart the gateway to pick up the new `.env` value (or the absence of one).
+
 ## What the plugin does
 
 | Surface | Mechanism | Notes |
