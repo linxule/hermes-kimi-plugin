@@ -42,6 +42,7 @@ import struct
 import time
 import uuid
 from collections import OrderedDict, deque
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, AsyncIterator, Dict, List, Optional, Set, Tuple
@@ -1165,6 +1166,14 @@ class KimiAdapter(BasePlatformAdapter):
         self._group_task: Optional[asyncio.Task] = None
         self._dm_health_task: Optional[asyncio.Task] = None
         self._http_session: Optional[Any] = None  # aiohttp.ClientSession
+        # The event loop ``self._http_session`` was constructed on.  aiohttp
+        # binds ``ClientSession`` to ``asyncio.get_running_loop()`` at
+        # ``__init__`` time; using the session from a different loop later
+        # makes ``TimerContext`` raise ``RuntimeError("Timeout context
+        # manager should be used inside a task")`` because
+        # ``asyncio.current_task(loop=session._loop)`` returns ``None``.
+        # See ``_session_for_current_loop`` for the cross-loop workaround.
+        self._http_session_loop: Optional[asyncio.AbstractEventLoop] = None
         self._ws: Optional[Any] = None  # active DM WS
 
         # DM traffic observability — count successfully dispatched
@@ -1386,6 +1395,7 @@ class KimiAdapter(BasePlatformAdapter):
         self._closing = False
         self._startup_ts = time.time()
         self._http_session = aiohttp.ClientSession()
+        self._http_session_loop = asyncio.get_running_loop()
 
         # Belt-and-braces sweep of parallel TTL state at the start of
         # every connect cycle. Standard teardown paths (disconnect,
@@ -1519,6 +1529,62 @@ class KimiAdapter(BasePlatformAdapter):
         await super().cancel_background_tasks()
         self._pending_enqueued_at.clear()
 
+    @asynccontextmanager
+    async def _session_for_current_loop(self) -> AsyncIterator[Any]:
+        """Yield an ``aiohttp.ClientSession`` bound to the running event loop.
+
+        The cached ``self._http_session`` is bound to whichever loop ran
+        ``connect()`` (the gateway main loop).  Hermes's
+        ``send_message_tool`` dispatches ``adapter.send()`` from a
+        worker-thread loop via ``_run_async`` →
+        ``worker_loop.run_until_complete``, which crosses event loops with
+        the gateway-bound session.  aiohttp's ``TimerContext.__enter__``
+        then raises ``RuntimeError("Timeout context manager should be used
+        inside a task")`` because
+        ``asyncio.current_task(loop=session._loop)`` looks at the
+        gateway loop while we're on the worker loop.
+
+        Strategy:
+        - Same loop as the cached session → yield the cached session
+          (connection pool preserved for normal traffic).
+        - No cached session yet → create one on the current loop and cache
+          it for reuse.
+        - Different loop than the cached session → yield an ephemeral
+          session bound to the current loop, closed when the ``async
+          with`` block exits.  Single-connection cost on cross-loop calls
+          is acceptable; the alternative is the bug.
+
+        Counterpart upstream issue: ``send_message_tool`` should marshal
+        ``adapter.send()`` back to the gateway loop via
+        ``asyncio.run_coroutine_threadsafe`` rather than running the
+        coroutine on the worker loop.  Until then, this helper is the
+        plugin-side workaround.
+        """
+        current_loop = asyncio.get_running_loop()
+        cached = self._http_session
+        if cached is None:
+            # First-ever lazy creation — cache on the current loop.
+            self._http_session = aiohttp.ClientSession()
+            self._http_session_loop = current_loop
+            yield self._http_session
+            return
+        if getattr(cached, "closed", False):
+            # Stale closed session — replace on the current loop.
+            self._http_session = aiohttp.ClientSession()
+            self._http_session_loop = current_loop
+            yield self._http_session
+            return
+        if self._http_session_loop is None or self._http_session_loop is current_loop:
+            # Either same loop, or caller installed the session directly
+            # (e.g. a test fixture that bypassed ``connect()``).  Either
+            # way, trust it; cross-loop protection only kicks in when we
+            # have a known-bound loop that differs from the current one.
+            yield cached
+            return
+        # Cross-loop: ephemeral session scoped to this call.
+        async with aiohttp.ClientSession() as ephemeral:
+            yield ephemeral
+
     async def _cleanup_http(self) -> None:
         if self._http_session is not None:
             try:
@@ -1526,6 +1592,7 @@ class KimiAdapter(BasePlatformAdapter):
             except Exception:
                 pass
             self._http_session = None
+            self._http_session_loop = None
 
     # ──────────────────────────────────────────────────────────────────────
     # ── Lift 3a: handle_message override ─────────────────────────────────
@@ -2020,16 +2087,15 @@ class KimiAdapter(BasePlatformAdapter):
                 reply_to=reply_to,
                 metadata=metadata,
             )
-        if self._http_session is None:
-            self._http_session = aiohttp.ClientSession()
         try:
-            uploaded = await _upload_kimi_files(
-                self._http_session,
-                paths=[file_path],
-                bot_token=self._bot_token,
-                upload_url=self._upload_url,
-                timeout_s=self._file_timeout_s,
-            )
+            async with self._session_for_current_loop() as session:
+                uploaded = await _upload_kimi_files(
+                    session,
+                    paths=[file_path],
+                    bot_token=self._bot_token,
+                    upload_url=self._upload_url,
+                    timeout_s=self._file_timeout_s,
+                )
         except KimiAuthError as exc:
             return SendResult(success=False, error=str(exc), retryable=False)
         except KimiTransientError as exc:
@@ -2538,9 +2604,8 @@ class KimiAdapter(BasePlatformAdapter):
         headers = self._http_headers(streaming=True)
         body = self._encode_envelope(b"{}")
 
-        assert self._http_session is not None
         try:
-            async with self._http_session.post(
+            async with self._session_for_current_loop() as session, session.post(
                 url,
                 data=body,
                 headers=headers,
@@ -3208,12 +3273,9 @@ class KimiAdapter(BasePlatformAdapter):
         existing = self._find_cached_kimi_file(file_id)
         if existing:
             return existing
-        if self._http_session is None:
-            self._http_session = aiohttp.ClientSession()
-
         metadata_url = _file_metadata_endpoint(self._kimiapi_host, file_id)
         try:
-            async with self._http_session.get(
+            async with self._session_for_current_loop() as session, session.get(
                 metadata_url,
                 headers={"X-Kimi-Bot-Token": self._bot_token, "Accept": "application/json"},
                 timeout=aiohttp.ClientTimeout(total=self._file_timeout_s),
@@ -3247,7 +3309,7 @@ class KimiAdapter(BasePlatformAdapter):
         local_name = f"{file_id}_{_sanitize_kimi_file_name(name)}"
         local_path = self._file_download_dir / local_name
         try:
-            async with self._http_session.get(
+            async with self._session_for_current_loop() as session, session.get(
                 download_url,
                 timeout=aiohttp.ClientTimeout(total=self._file_timeout_s),
             ) as resp:
@@ -3394,12 +3456,10 @@ class KimiAdapter(BasePlatformAdapter):
             KimiTransientError on HTTP 429/5xx/network errors.
             KimiRpcError      on other 4xx with JSON error body.
         """
-        if self._http_session is None:
-            self._http_session = aiohttp.ClientSession()
         url = f"{self._base_url}/{_IM_SERVICE}/{method}"
         headers = self._http_headers(streaming=False)
         try:
-            async with self._http_session.post(
+            async with self._session_for_current_loop() as session, session.post(
                 url,
                 data=json.dumps(body).encode("utf-8"),
                 headers=headers,

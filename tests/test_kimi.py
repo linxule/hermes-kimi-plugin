@@ -364,6 +364,132 @@ class StandaloneSendRegistryWrapperTests(unittest.TestCase):
         )
 
 
+class CrossLoopSessionTests(unittest.TestCase):
+    """Regression coverage for the cross-loop aiohttp ``ClientSession`` bug.
+
+    Hermes's ``send_message_tool`` dispatches ``adapter.send()`` from a
+    worker-thread event loop via ``_run_async`` →
+    ``worker_loop.run_until_complete``.  But ``adapter.connect()`` runs
+    on the gateway's main loop and creates ``self._http_session`` there;
+    aiohttp binds ``ClientSession`` to the running loop at ``__init__``.
+    Using the gateway-bound session from a worker loop later raises
+    ``RuntimeError("Timeout context manager should be used inside a
+    task")`` because ``asyncio.current_task(loop=session._loop)`` returns
+    ``None`` from the worker loop's perspective.
+
+    ``_session_for_current_loop`` is the plugin-side workaround.  An
+    upstream issue tracks the broader fix in
+    ``send_message_tool._send_via_adapter``.
+    """
+
+    def _make_adapter(self) -> KimiAdapter:
+        return KimiAdapter(_cfg())
+
+    def test_first_call_caches_session_on_current_loop(self):
+        adapter = self._make_adapter()
+        self.assertIsNone(adapter._http_session)
+        self.assertIsNone(adapter._http_session_loop)
+
+        async def scenario():
+            async with adapter._session_for_current_loop() as session:
+                self.assertIs(adapter._http_session, session)
+                self.assertIs(
+                    adapter._http_session_loop,
+                    asyncio.get_running_loop(),
+                )
+                return session
+
+        try:
+            cached = asyncio.run(scenario())
+            # Same-loop reuse: another asyncio.run gives a NEW loop, so
+            # the cached session would actually be ephemeral here; tested
+            # in ``test_same_loop_reuses_cached_session`` with a single
+            # ``asyncio.run`` block instead.
+            self.assertTrue(cached.closed or not cached.closed)  # tautology fine
+        finally:
+            if adapter._http_session is not None and not adapter._http_session.closed:
+                # asyncio.run() closed the loop; the cached session is now
+                # bound to a dead loop. Test cleanup is best-effort.
+                pass
+
+    def test_same_loop_reuses_cached_session(self):
+        adapter = self._make_adapter()
+
+        async def scenario():
+            async with adapter._session_for_current_loop() as s1:
+                first = s1
+            async with adapter._session_for_current_loop() as s2:
+                second = s2
+            return first, second
+
+        first, second = asyncio.run(scenario())
+        self.assertIs(first, second, "Same loop must reuse the cached session")
+
+    def test_cross_loop_yields_ephemeral_session(self):
+        """The exact scenario send_message_tool exercises in production."""
+        adapter = self._make_adapter()
+
+        # Loop A: simulate connect() — populate _http_session and
+        # _http_session_loop. Keep the loop alive afterwards so the
+        # cached session stays bound to a live loop.
+        loop_a = asyncio.new_event_loop()
+        try:
+            async def seed_on_loop_a():
+                async with adapter._session_for_current_loop() as s:
+                    return s
+            cached = loop_a.run_until_complete(seed_on_loop_a())
+            self.assertIs(adapter._http_session, cached)
+            self.assertIs(adapter._http_session_loop, loop_a)
+
+            # Loop B: simulate send_message_tool's worker-thread dispatch.
+            loop_b = asyncio.new_event_loop()
+            try:
+                ephemerals = []
+                async def use_on_loop_b():
+                    async with adapter._session_for_current_loop() as s:
+                        ephemerals.append(s)
+                        self.assertIsNot(
+                            s, cached,
+                            "Cross-loop call must NOT yield the cached session",
+                        )
+                        self.assertFalse(
+                            s.closed,
+                            "Ephemeral session must be open inside the block",
+                        )
+                loop_b.run_until_complete(use_on_loop_b())
+                self.assertTrue(
+                    ephemerals[0].closed,
+                    "Ephemeral session must be closed after the block exits",
+                )
+                # Cache is untouched.
+                self.assertIs(adapter._http_session, cached)
+                self.assertIs(adapter._http_session_loop, loop_a)
+            finally:
+                loop_b.close()
+        finally:
+            # Close the cached session on its own loop before tearing down.
+            if adapter._http_session is not None:
+                try:
+                    loop_a.run_until_complete(adapter._http_session.close())
+                except Exception:
+                    pass
+            loop_a.close()
+
+    def test_cleanup_resets_session_loop_tracking(self):
+        adapter = self._make_adapter()
+
+        async def scenario():
+            async with adapter._session_for_current_loop():
+                pass
+            self.assertIsNotNone(adapter._http_session)
+            self.assertIsNotNone(adapter._http_session_loop)
+            await adapter._cleanup_http()
+            self.assertIsNone(adapter._http_session)
+            self.assertIsNone(adapter._http_session_loop)
+
+        asyncio.run(scenario())
+
+
 class AdapterInitTests(unittest.TestCase):
     def test_config_parsing(self):
         cfg = _cfg(
@@ -2193,7 +2319,13 @@ class SubscribeBackoffStateTests(unittest.IsolatedAsyncioTestCase):
         return _gen
 
     def _install_fake_session(self, adapter):
-        """Replace _http_session.post() with a context manager yielding HTTP 200."""
+        """Replace _http_session.post() with a context manager yielding HTTP 200.
+
+        Also pins ``_http_session_loop`` to the currently running loop so
+        ``_session_for_current_loop`` treats the fixture as same-loop and
+        yields the mock as-is, instead of creating an ephemeral aiohttp
+        session that would bypass the mock.
+        """
         resp = MagicMock()
         resp.status = 200
 
@@ -2207,6 +2339,13 @@ class SubscribeBackoffStateTests(unittest.IsolatedAsyncioTestCase):
         session = MagicMock()
         session.post = MagicMock(return_value=_AsyncCtx())
         adapter._http_session = session
+        try:
+            adapter._http_session_loop = asyncio.get_running_loop()
+        except RuntimeError:
+            # Called outside a running loop (sync setUp). The helper's
+            # ``_http_session_loop is None`` branch treats this as
+            # caller-installed and yields as-is, so leave it None.
+            pass
 
     async def test_subscribe_backoff_resets_to_floor_after_first_frame(self):
         adapter = KimiAdapter(_cfg())
