@@ -1089,6 +1089,23 @@ class KimiAdapter(BasePlatformAdapter):
             config.extra.get("group_require_mention", False)
         )
 
+        # Per-chat exemption from the mention gate. Mirrors the Matrix/DingTalk
+        # `free_response_chats` pattern: when `group_require_mention=True`, rooms
+        # listed here bypass the mention requirement and respond to every message.
+        # Necessary because Kimi has no wire-level distinction between 1:1 DM and
+        # group rooms — both are `room:<uuid>` — so a global mention requirement
+        # silently swallows DM traffic without an exempt list. Accepts both keys
+        # for cross-platform familiarity; `kimi_free_response_chats` is the
+        # documented name, the other is an alias.
+        _exempt_raw = (
+            config.extra.get("kimi_free_response_chats")
+            or config.extra.get("group_require_mention_exempt_rooms")
+            or []
+        )
+        self._group_require_mention_exempt_rooms: frozenset[str] = frozenset(
+            str(r) for r in _exempt_raw if isinstance(r, str) and r
+        )
+
         # Short_id / id allowlist — authoritative identity-based bypass of role filter
         trusted = config.extra.get("group_trusted_senders") or []
         self._group_trusted_senders: frozenset[str] = frozenset(
@@ -1725,11 +1742,17 @@ class KimiAdapter(BasePlatformAdapter):
             check.
         """
         # ── Lift 3b: output_mode gate ─────────────────────────────────────
-        # In ``tool_only`` mode the agent's prose responses are suppressed;
-        # only explicit ``send_message_tool`` calls (which route through the
-        # standalone ``send_kimi_message`` function, bypassing this method)
-        # produce visible Kimi messages.  Default is ``passthrough`` so
-        # production behavior is unchanged.
+        # In ``tool_only`` mode the agent's prose responses are suppressed.
+        #
+        # Known limitation against current upstream Hermes (≤ 0.14.0):
+        # ``send_message_tool._send_via_adapter`` prefers the live adapter
+        # over ``standalone_sender_fn`` when both exist, so explicit tool
+        # sends ALSO route through this method and are also suppressed in
+        # ``tool_only`` mode.  See README "Known limitation: tool_only +
+        # send_message_tool" for workarounds + the upstream issue tracking
+        # the fix (prefer ``standalone_sender_fn`` over live adapter).
+        #
+        # Default is ``passthrough`` so production behavior is unchanged.
         if self._output_mode == "tool_only":
             logger.debug(
                 "Kimi: output_mode=tool_only — suppressing prose send to %s",
@@ -3154,7 +3177,15 @@ class KimiAdapter(BasePlatformAdapter):
 
         # Mention gate: if configured to require mentions and the message
         # doesn't reference us, ignore. Supports both numeric id and short_id.
-        if self._group_require_mention and not self._is_mention_of_me(msg):
+        # Rooms in `kimi_free_response_chats` bypass this — used for 1:1 DMs
+        # (which Kimi delivers as `room:<uuid>` indistinguishable from groups)
+        # and for any group where the user wants free-response behavior despite
+        # the global default.
+        if (
+            self._group_require_mention
+            and chat_id not in self._group_require_mention_exempt_rooms
+            and not self._is_mention_of_me(msg)
+        ):
             logger.info(
                 "Kimi groups: dropping message %s/%s (group_require_mention=true, no @mention of us)",
                 chat_id,

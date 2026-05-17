@@ -6,6 +6,8 @@ Bridges Hermes Agent gateways to a single Kimi bot identity, handling **direct m
 
 ## Status
 
+> **v2.1.2 (2026-05-17) — `kimi_free_response_chats` exempt list for the mention gate.** Setting `group_require_mention=true` globally previously swallowed DM traffic because Kimi delivers 1:1 conversations as `room:<uuid>` indistinguishable from group rooms at the wire level. This release adds a Matrix/DingTalk-style per-chat allowlist (`kimi_free_response_chats`) so the user can require @-mentions in groups while keeping the DM free-response. Also accepts `group_require_mention_exempt_rooms` as an explicit alias. 7 new tests in `MentionGateExemptionTests`. See "Group participation" section below for the recommended config patterns including how this interacts with Kimi's platform-level "restricted vs. open visibility mode" routing. **Also**: hardened the `_install_fake_session` test fixture to pin `session.closed = False`, plugging a latent v2.1.1 issue where every backoff-test session was being silently replaced with a real `aiohttp.ClientSession()` because `MagicMock().closed` is truthy by default. The cross-loop helper's `getattr(cached, "closed", False)` check is correct for production (real aiohttp `.closed` is a proper bool); the fixture just needed to match that contract. Suite now 227/227 in <1s, up from 220 tests with intermittent timeouts.
+>
 > **v2.1.1 (2026-05-17) — cross-loop aiohttp session workaround.** v2.1.0 wired the `send_message` tool path for Kimi targets for the first time, which surfaced a latent cross-event-loop bug: `KimiAdapter.connect()` creates `self._http_session` on the gateway's main event loop, but Hermes's `send_message_tool` dispatches `adapter.send()` from a worker-thread event loop via `_run_async` → `worker_loop.run_until_complete`. aiohttp binds `ClientSession` to whichever loop is running at `__init__` time; using the session from a different loop later raises `RuntimeError("Timeout context manager should be used inside a task")` because `asyncio.current_task(loop=session._loop)` returns `None` from the worker loop. This release adds a `_session_for_current_loop()` async-context-manager helper that yields the cached session when the current loop matches and an ephemeral session bound to the current loop otherwise (connection-pool reuse preserved for normal traffic; single-connection cost on cross-loop calls). All five session call sites refactored. 4 new regression tests for `CrossLoopSessionTests`. An upstream issue tracks the broader fix in `tools/send_message_tool.py` — once landed, this plugin-side workaround becomes redundant but stays safe (idempotent when loops match).
 >
 > **v2.1.0 (2026-05-17) — out-of-process cron delivery + top-level YAML config bridge.** Three changes: (1) wired `standalone_sender_fn=_standalone_send` into `register()` so cron jobs and `send_message_tool` can deliver to Kimi rooms without a live in-process adapter (e.g. when cron runs in a separate process from the gateway); (2) fixed `env_enablement_fn` to seed `home_channel` as a dict (`{"chat_id": ..., "name": ...}`) matching upstream's `HomeChannel` contract — the previous string form silently failed the `isinstance(home, dict)` check in `gateway/config.py:1855-1871`, so cron home-channel delivery never worked despite `KIMI_HOME_CHANNEL` being set; (3) corrected `apply_yaml_config_fn` docstring + README to reflect that the bridge reads a **top-level `kimi:` block** (per `yaml_cfg.get(entry.name)` in `gateway/config.py:871`), not `platforms.kimi.*`. 5 new tests for the wrapper contract + end-to-end YAML→env→`HomeChannel` integration tests. All 216 tests pass.
@@ -171,6 +173,56 @@ The room UUIDs kimi.com assigns to a 1:1 conversation are **derived from the bot
 
 Either way, restart the gateway to pick up the new `.env` value (or the absence of one).
 
+### Group participation: mention gate + exempt list
+
+Kimi's wire model is one of the awkward facts about this platform: **1:1 conversations and group rooms both use `room:<uuid>`** with no field distinguishing them. From the adapter's perspective every inbound message looks like "a message from some room." This breaks the usual "DM = respond freely, group = require @-mention" split that platforms like Telegram, Discord, and Matrix can encode at the wire level.
+
+The plugin handles it with two cooperating layers:
+
+1. **`group_require_mention`** (boolean, default `false`) — adapter-wide gate. When `true`, any message that doesn't @-mention the bot is dropped before reaching Hermes.
+2. **`kimi_free_response_chats`** (list of `room:<uuid>`, default empty) — per-chat exempt list. Rooms in this list bypass the mention gate even when `group_require_mention=true`. This is where you put the DM room.
+
+#### Interaction with Kimi's platform-level visibility mode
+
+Kimi.com has a **platform-level routing setting** that operates *above* the adapter. As Kimi's group conductor describes it:
+
+> in restricted mode, the platform literally only delivers a given message to the members who are @mentioned in it (plus the conductor). in open mode, the platform delivers every main chat message to every member in the group.
+>
+> so for an external agent with its own gateway — like your Pi in London — the gateway receives whatever the platform sends it. the agent's local settings determine what it actually does with those messages (auto-respond, only respond when addressed, ignore unless tagged, etc.), but the platform setting controls what the gateway receives in the first place.
+
+This means `group_require_mention=true` is a **defense-in-depth** filter, not a stand-alone gate:
+
+- **Restricted-mode groups**: Kimi pre-filters at the platform. The gateway only receives @-mentions of the bot. `group_require_mention=true` matches every incoming message and is effectively a no-op; setting it costs nothing but isn't required.
+- **Open-mode groups**: Kimi delivers everything. The bot decides via `group_require_mention`. This is the case where the local gate earns its keep.
+- **1:1 DMs**: not affected by visibility mode (it's a 2-person room). Always delivered.
+
+#### Recommended configurations
+
+| Use case | Kimi room mode | `group_require_mention` | `kimi_free_response_chats` |
+|---|---|---|---|
+| 1:1 DM only, no groups | n/a | doesn't matter | unset |
+| 1:1 DM + open-mode groups, stay quiet unless tagged | open | `true` | `[room:<dm-uuid>]` |
+| 1:1 DM + restricted-mode groups | restricted | doesn't matter | unset (DM and group both pre-filtered correctly) |
+| 1:1 DM + free-response open-mode groups | open | `false` | unset |
+
+The most defensive pattern when you don't know your peers' room-mode preferences is **option 2**: `group_require_mention=true` + DM exempted. It works correctly regardless of whether the groups are restricted or open mode, because either Kimi pre-filters (and the local gate doesn't fire) or Kimi delivers everything (and the local gate handles it).
+
+#### Example config
+
+```yaml
+platforms:
+  kimi:
+    enabled: true
+    extra:
+      group_require_mention: true
+      kimi_free_response_chats:
+        - room:19e31a29-4722-8804-8000-094a7731741b   # 1:1 DM with the user
+        # Add additional room UUIDs here if you want certain groups to be
+        # free-response regardless of the global mention gate.
+```
+
+The room UUIDs come from the same place as `KIMI_HOME_CHANNEL` — your gateway's `inbound message` log line (`chat=room:<uuid>`). The plugin tolerates `group_require_mention_exempt_rooms` as an alias if you find that name more explicit.
+
 ## What the plugin does
 
 | Surface | Mechanism | Notes |
@@ -185,26 +237,45 @@ Either way, restart the gateway to pick up the new `.env` value (or the absence 
 
 ### Picking an `output_mode`
 
-Hermes routes outbound messages to Kimi via two distinct paths, and `output_mode` only gates the first:
+Hermes routes outbound messages to Kimi via two distinct paths:
 
 | # | Path | Triggered by | Gated by `output_mode`? |
 |---|---|---|---|
-| 1 | `adapter.send()` | The gateway run-loop, for each chunk of agent prose during a streaming turn | **Yes** |
-| 2 | `send_kimi_message()` (module-level helper) | The `send_message_tool` (agent's explicit tool call) and the cron scheduler's Kimi delivery path | **No** |
+| 1 | `adapter.send()` | The gateway run-loop streaming agent prose; AND `send_message_tool` when a live adapter exists (upstream dispatch order — see [⚠️ Known limitation](#-known-limitation-tool_only--send_message_tool) below) | **Yes** |
+| 2 | `send_kimi_message()` (module-level helper) | `standalone_sender_fn` route — cron scheduler delivery when no live adapter is in-process; and `send_message_tool` as a fallback if the live adapter is unavailable | **No** |
 
 Modes:
 
 - **`passthrough`** *(default)* — both paths emit. Agent prose streams to Kimi as it's generated, plus tool-driven and cron sends. Matches every other Hermes platform adapter.
-- **`tool_only`** — path 1 is suppressed. Agent prose stays in Hermes logs but never reaches Kimi. Path 2 is unaffected: explicit `send_message_tool` calls and cron-delivered messages still appear normally. The user only sees output that the agent decided to emit via the tool.
+- **`tool_only`** — path 1 is suppressed. Agent prose stays in Hermes logs but never reaches Kimi. Useful for cron-only or batch deployments where the agent's streaming text isn't wanted at the platform layer.
 
-When `tool_only` is the right choice:
-- **Group rooms** where streaming prose would be noisy and the agent should emit a single curated reply.
-- **Multi-step agents** where intermediate "thinking out loud" is undesirable platform-side but useful in logs.
-- **Cron-only or tool-only deployments** with no interactive turns.
+#### ⚠️ Known limitation: `tool_only` + `send_message_tool`
 
-When to stay on `passthrough`:
+Against current upstream Hermes (`NousResearch/hermes-agent` ≤ 0.14.0), `send_message_tool._send_via_adapter` prefers the live adapter (`adapter.send()`) when one exists. That means explicit `send_message_tool` calls go through **Path 1** in practice, not Path 2 — so in `tool_only` mode they're silently suppressed alongside the gateway prose.
+
+In practice this affects:
+
+- **In-process gateways with `tool_only`**: agent's explicit tool sends to Kimi disappear (the adapter's `send()` returns `SendResult(success=True)` without dispatching). No error, no log warning.
+- **In-process gateways with `passthrough`** *(the default)*: unaffected — tool sends work normally because Path 1 isn't suppressed.
+- **Out-of-process cron with `tool_only`**: cron delivery still works because no live adapter is present, so dispatch falls through to `standalone_sender_fn` (Path 2).
+
+The right architectural fix is upstream: `send_message_tool` should prefer the registered `standalone_sender_fn` over the live adapter when one exists, since `standalone_sender_fn` is the plugin's documented "explicit-send" interface. An issue is staged for this at [`linxule/clawd-world:.research/upstream-issue-text/cross-loop-send-message-tool.md`](https://github.com/linxule/clawd-world) (not yet filed against upstream).
+
+Until that lands, two workarounds for `tool_only` deployments that need explicit tool sends:
+
+1. **Run cron out-of-process from the gateway** (separate `hermes cron` runner). Cron deliveries route via `standalone_sender_fn` and bypass the suppressed live-adapter `send()` cleanly.
+2. **Stay on `passthrough`** unless you've verified that your specific deployment shape doesn't depend on `send_message_tool` to Kimi.
+
+When `tool_only` is still the right choice (with the caveat above understood):
+
+- **Group rooms** where streaming prose would be noisy and the agent should emit a single curated reply via `send_message_tool` AND that delivery happens via out-of-process cron OR a future upstream Hermes that prefers `standalone_sender_fn`.
+- **Cron-only deployments** with no interactive turns and no in-process `send_message_tool` usage.
+
+When to stay on `passthrough` *(default)*:
+
 - **1:1 DMs** where the user expects streaming-response UX — silence under `tool_only` looks indistinguishable from a hung bot.
 - **Setups where the agent isn't reliably guided** (system prompt or skill nudge) to call `send_message_tool`. Without that guidance, `tool_only` makes the bot appear mute on every turn.
+- **Any in-process gateway** with mixed `send_message_tool` + cron usage until upstream prefers `standalone_sender_fn`.
 
 This flag exists because the bridge's previous workaround (`HIDE_TOOL_CALLS=1`) hung Hermes over stdio. The adapter's in-process coupling lets the suppression happen at the right layer without that deadlock.
 

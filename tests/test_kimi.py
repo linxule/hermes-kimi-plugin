@@ -399,18 +399,19 @@ class CrossLoopSessionTests(unittest.TestCase):
                 )
                 return session
 
+        # Use new_event_loop + run_until_complete (not asyncio.run) so the
+        # loop stays alive long enough to close the cached session cleanly
+        # — otherwise the session is bound to a closed loop on teardown
+        # and aiohttp emits an "Unclosed client session" ResourceWarning.
+        loop = asyncio.new_event_loop()
         try:
-            cached = asyncio.run(scenario())
-            # Same-loop reuse: another asyncio.run gives a NEW loop, so
-            # the cached session would actually be ephemeral here; tested
-            # in ``test_same_loop_reuses_cached_session`` with a single
-            # ``asyncio.run`` block instead.
-            self.assertTrue(cached.closed or not cached.closed)  # tautology fine
+            cached = loop.run_until_complete(scenario())
+            self.assertIs(adapter._http_session, cached)
+            self.assertFalse(cached.closed)
         finally:
             if adapter._http_session is not None and not adapter._http_session.closed:
-                # asyncio.run() closed the loop; the cached session is now
-                # bound to a dead loop. Test cleanup is best-effort.
-                pass
+                loop.run_until_complete(adapter._http_session.close())
+            loop.close()
 
     def test_same_loop_reuses_cached_session(self):
         adapter = self._make_adapter()
@@ -422,8 +423,14 @@ class CrossLoopSessionTests(unittest.TestCase):
                 second = s2
             return first, second
 
-        first, second = asyncio.run(scenario())
-        self.assertIs(first, second, "Same loop must reuse the cached session")
+        loop = asyncio.new_event_loop()
+        try:
+            first, second = loop.run_until_complete(scenario())
+            self.assertIs(first, second, "Same loop must reuse the cached session")
+        finally:
+            if adapter._http_session is not None and not adapter._http_session.closed:
+                loop.run_until_complete(adapter._http_session.close())
+            loop.close()
 
     def test_cross_loop_yields_ephemeral_session(self):
         """The exact scenario send_message_tool exercises in production."""
@@ -1387,6 +1394,126 @@ class GroupRequireMentionSharedHelperTests(unittest.IsolatedAsyncioTestCase):
         adapter2.handle_message.assert_awaited_once()
 
 
+class MentionGateExemptionTests(unittest.IsolatedAsyncioTestCase):
+    """`kimi_free_response_chats` bypasses the mention gate per chat_id.
+
+    Necessary because Kimi delivers both 1:1 DMs and group rooms as
+    `room:<uuid>` with no wire-level distinction. A global
+    `group_require_mention=True` would otherwise swallow DM traffic.
+    """
+
+    def test_default_exempt_list_is_empty(self):
+        adapter = KimiAdapter(_cfg(group_require_mention=True))
+        self.assertEqual(adapter._group_require_mention_exempt_rooms, frozenset())
+
+    def test_exempt_list_loaded_from_config(self):
+        adapter = KimiAdapter(_cfg(
+            group_require_mention=True,
+            kimi_free_response_chats=["room:aaa", "room:bbb"],
+        ))
+        self.assertEqual(
+            adapter._group_require_mention_exempt_rooms,
+            frozenset({"room:aaa", "room:bbb"}),
+        )
+
+    def test_alias_key_recognized(self):
+        # group_require_mention_exempt_rooms is accepted as an alias for the
+        # documented kimi_free_response_chats key. Useful for users coming
+        # from the explicit name.
+        adapter = KimiAdapter(_cfg(
+            group_require_mention=True,
+            group_require_mention_exempt_rooms=["room:zzz"],
+        ))
+        self.assertEqual(
+            adapter._group_require_mention_exempt_rooms,
+            frozenset({"room:zzz"}),
+        )
+
+    def test_non_string_entries_filtered(self):
+        # Be tolerant of YAML-side garbage (None, ints, empty strings).
+        adapter = KimiAdapter(_cfg(
+            group_require_mention=True,
+            kimi_free_response_chats=["room:ok", "", None, 42, "room:also-ok"],
+        ))
+        self.assertEqual(
+            adapter._group_require_mention_exempt_rooms,
+            frozenset({"room:ok", "room:also-ok"}),
+        )
+
+    async def test_exempt_room_bypasses_mention_gate(self):
+        # Message in an exempt room, no @-mention → still dispatched.
+        # This is the DM-as-room case in production.
+        adapter = KimiAdapter(_cfg(
+            group_require_mention=True,
+            kimi_free_response_chats=["chat-dm"],
+        ))
+        adapter._me_short_id = "u_me"
+        adapter.handle_message = AsyncMock()  # type: ignore
+        adapter._hydrate_missing_text = False  # Fix A
+
+        await adapter._on_group_event({
+            "chatMessage": {
+                "chatId": "chat-dm",
+                "messageId": "msg-dm-1",
+                "status": "STATUS_COMPLETED",
+                "role": "USER",
+                "senderId": "user-1",
+                "senderShortId": "u_user",
+                "summary": "no mention here, just talking in DM",
+            },
+        })
+        adapter.handle_message.assert_awaited_once()
+
+    async def test_non_exempt_room_still_gated(self):
+        # Same adapter as above, different room, no mention → dropped.
+        # Confirms the exempt list is per-chat_id, not a global disable.
+        adapter = KimiAdapter(_cfg(
+            group_require_mention=True,
+            kimi_free_response_chats=["chat-dm"],
+        ))
+        adapter._me_short_id = "u_me"
+        adapter.handle_message = AsyncMock()  # type: ignore
+        adapter._hydrate_missing_text = False
+
+        await adapter._on_group_event({
+            "chatMessage": {
+                "chatId": "chat-other-group",
+                "messageId": "msg-grp-1",
+                "status": "STATUS_COMPLETED",
+                "role": "USER",
+                "senderId": "user-1",
+                "senderShortId": "u_user",
+                "summary": "no mention here either",
+            },
+        })
+        adapter.handle_message.assert_not_awaited()
+
+    async def test_exempt_room_with_mention_still_works(self):
+        # Sanity: mention gate ALSO bypassed if the message has a mention —
+        # exempt list is an additive bypass, not a replacement of the mention path.
+        adapter = KimiAdapter(_cfg(
+            group_require_mention=True,
+            kimi_free_response_chats=["chat-dm"],
+        ))
+        adapter._me_short_id = "u_me"
+        adapter.handle_message = AsyncMock()  # type: ignore
+        adapter._hydrate_missing_text = False
+
+        await adapter._on_group_event({
+            "chatMessage": {
+                "chatId": "chat-dm",
+                "messageId": "msg-dm-2",
+                "status": "STATUS_COMPLETED",
+                "role": "USER",
+                "senderId": "user-1",
+                "senderShortId": "u_user",
+                "summary": "hey @u_me",
+                "mentions": [{"short_id": "u_me"}],
+            },
+        })
+        adapter.handle_message.assert_awaited_once()
+
+
 class ThreadRoutingTests(unittest.IsolatedAsyncioTestCase):
     """Inbound/outbound thread routing preserves thread identity.
 
@@ -2337,6 +2464,17 @@ class SubscribeBackoffStateTests(unittest.IsolatedAsyncioTestCase):
                 return False
 
         session = MagicMock()
+        # MagicMock attributes are themselves MagicMocks (truthy by default),
+        # so ``cached.closed`` would always test as truthy in
+        # ``_session_for_current_loop``'s ``getattr(cached, "closed", False)``
+        # check, sending the helper into the "stale session, recreate" branch
+        # — which silently replaces this fixture with a real
+        # ``aiohttp.ClientSession()`` and dials kimi.com for real.  Pinning
+        # the attribute to ``False`` keeps the helper on the cached-yield
+        # path so tests actually exercise the mock they installed.  Real
+        # production aiohttp sessions expose ``.closed`` as a proper bool,
+        # so the helper's check is correct there.
+        session.closed = False
         session.post = MagicMock(return_value=_AsyncCtx())
         adapter._http_session = session
         try:
