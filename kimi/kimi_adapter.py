@@ -1804,7 +1804,34 @@ class KimiAdapter(BasePlatformAdapter):
             )
         except KimiAuthError as exc:
             return SendResult(success=False, error=str(exc), retryable=False)
-        except (KimiTransientError, asyncio.TimeoutError) as exc:
+        except asyncio.TimeoutError:
+            # Kimi.com server occasionally accepts a SendMessage POST internally
+            # but holds the HTTP response on that TCP connection, causing
+            # aiohttp.ClientTimeout(total=_RPC_TIMEOUT_S) to fire client-side at
+            # exactly 30 s.  Production capture 2026-05-17:  one SendMessage
+            # entered `_rpc_unary` at T+0 and never received RESPONSE_HEADERS,
+            # while a concurrent SendMessage on the same adapter / same session
+            # completed in 697 ms during the same window — proving the hang is
+            # per-connection, not per-pool.  The pre-timeout request is still
+            # processed server-side, so the previous policy of treating timeout
+            # as retryable delivered the message twice (user-visible duplicate).
+            # Mark non-retryable so the gateway does not double-send.  Genuine
+            # network failures still propagate as KimiTransientError below.
+            logger.warning(
+                "Kimi: SendMessage to %s timed out after %.1fs at the client; "
+                "kimi.com may still have accepted the message internally. "
+                "Marking non-retryable to avoid duplicate delivery.",
+                chat_id, _RPC_TIMEOUT_S,
+            )
+            return SendResult(
+                success=False,
+                error=(
+                    f"Kimi: send timed out after {_RPC_TIMEOUT_S:.0f}s "
+                    "(message may have been delivered server-side; not retrying)"
+                ),
+                retryable=False,
+            )
+        except KimiTransientError as exc:
             return SendResult(success=False, error=str(exc), retryable=True)
         except Exception as exc:
             logger.exception("Kimi: send failed")

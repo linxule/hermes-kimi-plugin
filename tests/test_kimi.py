@@ -706,6 +706,70 @@ class ChatIdRoutingTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("unknown chat_id format", result.error)
 
 
+class SendArmExceptionPolicyTests(unittest.IsolatedAsyncioTestCase):
+    """`send()` translates exceptions into ``SendResult.retryable``.
+
+    Regression for v2.1.4 duplicate-send fix:  asyncio.TimeoutError used to
+    be grouped with KimiTransientError and returned ``retryable=True``,
+    which let the gateway's retry wrapper re-POST the same SendMessage on
+    a fresh TCP connection.  Kimi.com's server-side delivery would already
+    have succeeded by then, so the user saw the message twice.
+
+    The diagnostic capture at 2026-05-17 18:46:03-18:46:37 BST proved a
+    single client-side ``ClientTimeout(total=30)`` corresponds to a
+    server-side accepted delivery (a concurrent SendMessage on the same
+    adapter completed in 697 ms during the same 30 s hang window).  The
+    fix marks TimeoutError non-retryable; ``KimiTransientError`` keeps
+    its retryable=True contract for genuine network failures.
+    """
+
+    async def test_timeout_returns_non_retryable(self):
+        # asyncio.TimeoutError from _send_group → retryable=False, warning logged.
+        adapter = KimiAdapter(_cfg())
+        adapter._send_group = AsyncMock(side_effect=asyncio.TimeoutError())
+        with self.assertLogs("kimi_adapter", level="WARNING") as cm:
+            result = await adapter.send("room:abc-def", "hello")
+        self.assertFalse(result.success)
+        self.assertFalse(result.retryable)
+        self.assertIn("timed out", result.error)
+        # WARNING includes chat_id + the configured timeout for ops triage.
+        warning_text = "\n".join(cm.output)
+        self.assertIn("room:abc-def", warning_text)
+        self.assertIn("Marking non-retryable", warning_text)
+
+    async def test_transient_error_remains_retryable(self):
+        # KimiTransientError (genuine network failure) → retryable=True.
+        adapter = KimiAdapter(_cfg())
+        adapter._send_group = AsyncMock(
+            side_effect=KimiTransientError("simulated network error"),
+        )
+        result = await adapter.send("room:abc-def", "hello")
+        self.assertFalse(result.success)
+        self.assertTrue(result.retryable)
+        self.assertIn("simulated network error", result.error)
+
+    async def test_auth_error_remains_non_retryable(self):
+        from kimi_adapter import KimiAuthError
+        adapter = KimiAdapter(_cfg())
+        adapter._send_group = AsyncMock(
+            side_effect=KimiAuthError("simulated 401"),
+        )
+        result = await adapter.send("room:abc-def", "hello")
+        self.assertFalse(result.success)
+        self.assertFalse(result.retryable)
+
+    async def test_dm_path_timeout_also_non_retryable(self):
+        # Same policy regardless of dispatch arm.  Kimi delivers user-bot 1:1
+        # conversations as room:<uuid>, so the dm: prefix is rarely exercised
+        # in production — but the contract should hold for both arms.
+        adapter = KimiAdapter(_cfg())
+        adapter._send_dm = AsyncMock(side_effect=asyncio.TimeoutError())
+        with self.assertLogs("kimi_adapter", level="WARNING"):
+            result = await adapter.send("dm:im:kimi:main", "hello")
+        self.assertFalse(result.success)
+        self.assertFalse(result.retryable)
+
+
 class DedupTests(unittest.TestCase):
     def test_same_pair_deduped(self):
         adapter = KimiAdapter(_cfg())
