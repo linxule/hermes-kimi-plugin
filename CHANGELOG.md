@@ -2,6 +2,15 @@
 
 All notable changes to `hermes-kimi-plugin`. Format loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); the project uses semver where API contract changes bump major, behavior changes bump minor, and bug fixes bump patch.
 
+## [2.2.2] — 2026-05-18
+
+### Docs
+- New **Plugin-author notes** section in the README documenting the four cross-cutting patterns this plugin has converged on for other external messaging-platform plugin authors: (1) the `_session_for_current_loop()` cross-loop `aiohttp.ClientSession` binding pattern (with a sketch implementation and the same-loop / cross-loop / closed-replacement decision tree); (2) `trust_env=True` rationale at every `ClientSession` construction site (per v2.1.6); (3) send-timeout `retryable=False` semantics for client-side `asyncio.TimeoutError` (per v2.1.4 / v2.1.5) versus genuine network failures keeping `retryable=True`; (4) the current upstream `${VAR}` resolution gap for external-plugin tokens — and the in-flight upstream branch `feat/platform-registry-env-template` (PR-C, NousResearch/hermes-agent) that closes it.
+- Section is reference material aimed at the next external messaging-platform plugin author. No behavior change to this plugin; no test changes.
+
+### Context
+- Companion to the in-flight upstream PR-C work. Surfaces operational lessons from running this plugin against vanilla upstream Hermes since 2026-04-27 that other plugin authors would otherwise have to rediscover.
+
 ## [2.2.1] — 2026-05-18
 
 ### Changed

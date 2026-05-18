@@ -6,7 +6,7 @@ Bridges Hermes Agent gateways to a single Kimi bot identity, handling **direct m
 
 ## Status
 
-Current version: **2.2.1**. Targets vanilla upstream `NousResearch/hermes-agent` ≥ 0.14.0 (uses `ctx.register_platform()` and `apply_yaml_config_fn`). See [CHANGELOG.md](CHANGELOG.md) for the full release history.
+Current version: **2.2.2**. Targets vanilla upstream `NousResearch/hermes-agent` ≥ 0.14.0 (uses `ctx.register_platform()` and `apply_yaml_config_fn`). See [CHANGELOG.md](CHANGELOG.md) for the full release history.
 
 Production reference: the plugin has been running continuously on a long-lived Raspberry Pi deployment since 2026-04-27, first against a fork branch and now against vanilla upstream `main`. Gateway log lines like `Plugin 'kimi' registered platform: kimi` and `hermes_plugins.kimi.kimi_adapter: Kimi: connected as <bot-name>` confirm the plugin path is active end-to-end.
 
@@ -394,6 +394,71 @@ The plugin code lives in two files at the repo root:
 `_compat/registry.py` is a vendored compatibility shim: it tries to import the upstream registry, and re-raises `ImportError` with an actionable message if the hook isn't present. This makes the plugin's requirements explicit at import time.
 
 `tests/test_kimi.py` contains the adapter unit tests. They cover envelope codec, chat-id routing, dedup, MessageEvent synthesis, slash-command detection, mention-gate exemption, cross-loop session handling, and the send-arm exception policy. Plugin-integration tests (registry registration, dispatch, in-tree fallback) live in the in-fork suite at `tests/hermes_cli/test_kimi_plugin_integration.py` and are not duplicated here because they depend on the full Hermes plugin loader runtime.
+
+## Plugin-author notes (for other external platform authors)
+
+This section is for someone writing their own external Hermes platform plugin (`ctx.register_platform()` based, not in-tree). The patterns below were learned the hard way while running this adapter in production; documenting them so the next plugin author doesn't have to rediscover them.
+
+### Cross-loop `aiohttp.ClientSession` binding
+
+**Problem.** A `ClientSession` is bound to whichever asyncio event loop ran its constructor. If your adapter caches a session created at `connect()` time (gateway main loop), and Hermes's `send_message_tool` later invokes `adapter.send()` from a worker-thread loop via `_run_async` → `worker_loop.run_until_complete`, the cached session is reached from the *wrong* loop. aiohttp's `TimerContext.__enter__` raises:
+
+```
+RuntimeError: Timeout context manager should be used inside a task
+```
+
+…because `asyncio.current_task(loop=session._loop)` looks at the gateway loop while you're on the worker loop.
+
+**Plugin-side workaround.** Gate every `ClientSession` use through an async-context-manager helper that returns the cached session when loops match, or an ephemeral same-loop session otherwise. Sketch:
+
+```python
+@asynccontextmanager
+async def _session_for_current_loop(self):
+    current_loop = asyncio.get_running_loop()
+    cached = self._http_session
+    if cached is None or getattr(cached, "closed", False):
+        # First use or stale — create on the current loop and cache.
+        self._http_session = aiohttp.ClientSession(trust_env=True)
+        self._http_session_loop = current_loop
+        yield self._http_session
+        return
+    if self._http_session_loop is None or self._http_session_loop is current_loop:
+        yield cached
+        return
+    # Cross-loop: ephemeral session scoped to this call only.
+    async with aiohttp.ClientSession(trust_env=True) as ephemeral:
+        yield ephemeral
+```
+
+Then everywhere in the adapter that needs HTTP:
+
+```python
+async with self._session_for_current_loop() as session, session.post(...) as r:
+    ...
+```
+
+See `kimi/kimi_adapter.py` (`_session_for_current_loop`, ~line 1616) for the production implementation including a closed-session guard and the loop-tracking attribute set on `connect()`.
+
+**Trade-off.** Cross-loop calls pay a single-connection cost (ephemeral session, no pool reuse for that one request). Same-loop calls (the common case) reuse the cached pool. The alternative is the bug.
+
+**Upstream counterpart.** A future upstream improvement to `send_message_tool` would marshal `adapter.send()` back to the gateway loop via `asyncio.run_coroutine_threadsafe`, removing the cross-loop call entirely and making this helper obsolete. Until then, it's the plugin-side workaround.
+
+### `aiohttp.ClientSession(trust_env=True)` for proxy support (v2.1.6+ rationale)
+
+Always construct sessions with `trust_env=True` so they honour `HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY` / `NO_PROXY` env vars. Without it, aiohttp ignores proxy env vars and your plugin will silently bypass corporate / institutional proxies — symptoms are bare connection errors with no clue pointing at the proxy as the cause. This applies to every aiohttp session site in the adapter, not just the primary one.
+
+### Send-timeout retry semantics (v2.1.4+ rationale)
+
+If your platform's send endpoint can accept a request server-side but hold the response past the client-side timeout, mark `aiohttp.ClientTimeout` exceptions raised from sends as **non-retryable** in the result/error returned to Hermes. Hermes's retry layer will otherwise re-POST on a fresh connection and the user sees a duplicate. The trade-off favours "no duplicates" over the rare case of a genuine non-delivery (where the user sees nothing). For Hermes ≥ 0.14.0 this is signalled via `SendResult.retryable = False` (default) or `_set_fatal_error(code, message, *, retryable=False)` on auth-style errors that should not be retried.
+
+### Config-time `${VAR}` resolution (until upstream PR-C lands)
+
+Vanilla upstream Hermes does NOT apply `${VAR}` substitution to values inside `platforms.<plugin>.extra` (it does for built-in platforms via `_apply_env_overrides()` in `gateway/config.py`, but not for plugin-registered platforms). Until [this upstream PR](https://github.com/linxule/hermes-agent/tree/feat/platform-registry-env-template) lands, plugin authors should either:
+
+1. **Resolve defensively in the adapter** — accept the literal `"${MY_TOKEN}"` and call a small helper that returns `os.environ.get(name, "")` for whole-field matches. Idempotent and forward-compatible: when upstream resolves it first, the adapter sees the already-resolved value and the helper passes it through unchanged.
+2. **Use `apply_yaml_config_fn`** — the canonical config-translation hook shipped in v0.13.0 (`3633c8690`). Register a function in `register(ctx)` that walks the top-level YAML block and resolves whatever templates your plugin cares about. Right answer for non-trivial schemas; overkill for the common `${VAR}` case.
+
+This plugin uses approach (1) for forward-compat safety. See `kimi/kimi_adapter.py` if you want the helper as prior art.
 
 ## License
 
