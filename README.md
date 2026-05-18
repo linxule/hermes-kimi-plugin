@@ -6,7 +6,7 @@ Bridges Hermes Agent gateways to a single Kimi bot identity, handling **direct m
 
 ## Status
 
-Current version: **2.1.7**. Targets vanilla upstream `NousResearch/hermes-agent` ≥ 0.13.0 (uses `ctx.register_platform()` and `apply_yaml_config_fn`). See [CHANGELOG.md](CHANGELOG.md) for the full release history.
+Current version: **2.2.0**. Targets vanilla upstream `NousResearch/hermes-agent` ≥ 0.13.0 (uses `ctx.register_platform()` and `apply_yaml_config_fn`). See [CHANGELOG.md](CHANGELOG.md) for the full release history.
 
 Production reference: the plugin has been running continuously on a long-lived Raspberry Pi deployment since 2026-04-27, first against a fork branch and now against vanilla upstream `main`. Gateway log lines like `Plugin 'kimi' registered platform: kimi` and `hermes_plugins.kimi.kimi_adapter: Kimi: connected as <bot-name>` confirm the plugin path is active end-to-end.
 
@@ -171,10 +171,13 @@ Either way, restart the gateway to pick up the new `.env` value (or the absence 
 
 Kimi's wire model is one of the awkward facts about this platform: **1:1 conversations and group rooms both use `room:<uuid>`** with no field distinguishing them. From the adapter's perspective every inbound message looks like "a message from some room." This breaks the usual "DM = respond freely, group = require @-mention" split that platforms like Telegram, Discord, and Matrix can encode at the wire level.
 
-The plugin handles it with two cooperating layers:
+The plugin handles it with three cooperating layers:
 
 1. **`group_require_mention`** (boolean, default `false`) — adapter-wide gate. When `true`, any message that doesn't @-mention the bot is dropped before reaching Hermes.
-2. **`kimi_free_response_chats`** (list of `room:<uuid>`, default empty) — per-chat exempt list. Rooms in this list bypass the mention gate even when `group_require_mention=true`. This is where you put the DM room.
+2. **`kimi_free_response_chats`** (list of `room:<uuid>`, default empty) — per-chat exempt list. Rooms in this list bypass the mention gate even when `group_require_mention=true`. Use for **explicit operator policy** — "this small trusted group room should be free-response despite the global gate."
+3. **`kimi_dm_autodetect`** (boolean, default `false`, added in **v2.2.0**) — auto-bypass the gate for rooms structurally identifiable as DMs (exactly 2 members: bot + user). When `true`, the adapter calls `list_group_members` on rooms about to be dropped by the gate; 2-member rooms get auto-bypassed without operator config. Off by default for v2.2.0 — opt-in until stabilization; a future release may flip the default.
+
+The two config knobs serve different purposes and can be combined: `kimi_dm_autodetect=true` removes the need to list DM UUIDs in `kimi_free_response_chats` manually; the exempt list is still needed for explicit free-response groups (use case 2).
 
 #### Interaction with Kimi's platform-level visibility mode
 
@@ -216,6 +219,22 @@ platforms:
 ```
 
 The room UUIDs come from the same place as `KIMI_HOME_CHANNEL` — your gateway's `inbound message` log line (`chat=room:<uuid>`). The plugin tolerates `group_require_mention_exempt_rooms` as an alias if you find that name more explicit.
+
+**Or with `kimi_dm_autodetect=true`** (v2.2.0+) — DMs auto-bypass without listing UUIDs, exempt list only needed for explicit free-response group policy:
+
+```yaml
+platforms:
+  kimi:
+    enabled: true
+    extra:
+      group_require_mention: true
+      kimi_dm_autodetect: true   # 2-member rooms auto-bypass the gate
+      # kimi_free_response_chats only needed for explicit free-response groups:
+      # kimi_free_response_chats:
+      #   - room:<3plus-member-group-you-want-freely-responsive>
+```
+
+Performance note: `kimi_dm_autodetect` only fires on messages about to be dropped by the gate (i.e. when `group_require_mention=true` AND no @-mention AND not in the explicit exempt list). The detector then calls `list_group_members` once per new room (~50-200 ms RPC over WAN), cached for 5 minutes. Messages headed to dispatch never incur this cost — the fast path is unchanged.
 
 ## What the plugin does
 

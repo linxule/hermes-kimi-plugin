@@ -1924,6 +1924,206 @@ class MentionGateExemptionTests(unittest.IsolatedAsyncioTestCase):
         adapter.handle_message.assert_awaited_once()
 
 
+class DmAutodetectTests(unittest.IsolatedAsyncioTestCase):
+    """v2.2.0 room-distinguishability detector + mention-gate integration.
+
+    Kimi delivers 1:1 DMs as ``room:<uuid>`` indistinguishable from groups
+    at the envelope layer the adapter consumes.  Before v2.2.0 the only
+    workaround was to add the DM's room UUID to ``kimi_free_response_chats``
+    manually.  The ``kimi_dm_autodetect`` flag (default OFF) makes the
+    adapter call ``list_group_members`` on rooms about to be dropped by
+    the mention gate; rooms with exactly 2 members (bot + 1 user) bypass
+    the gate without operator config.
+
+    Default OFF preserves v2.1.x behaviour exactly; the test grouping
+    below mirrors that guarantee.
+
+    The detector is the LAST bypass chance — only consulted when the
+    message is otherwise about to be dropped.  Messages that already
+    qualify for dispatch (no gate, or mentioned, or in the explicit
+    exempt list) never incur the detector RPC.
+
+    See ``.review/b1-room-distinguishability-spike.md`` for the design
+    document covering cost analysis, race-window handling, and the
+    dual-use-case justification for keeping ``kimi_free_response_chats``.
+    """
+
+    def _build_msg(self, chat_id: str, with_mention: bool = False) -> Dict[str, Any]:
+        msg: Dict[str, Any] = {
+            "chatMessage": {
+                "chatId": chat_id,
+                "messageId": f"msg-for-{chat_id}",
+                "status": "STATUS_COMPLETED",
+                "role": "USER",
+                "senderId": "user-1",
+                "senderShortId": "u_user",
+                "summary": "hello bot",
+            },
+        }
+        if with_mention:
+            msg["chatMessage"]["mentions"] = [{"short_id": "u_me"}]
+        return msg
+
+    # ── _is_dm_room helper ────────────────────────────────────────────────
+
+    async def test_helper_returns_true_for_2_member_room(self):
+        adapter = KimiAdapter(_cfg())
+        adapter.list_group_members = AsyncMock(  # type: ignore[method-assign]
+            return_value=[{"id": "bot"}, {"id": "user-1"}],
+        )
+        self.assertTrue(await adapter._is_dm_room("room-uuid-1"))
+
+    async def test_helper_returns_false_for_3plus_member_room(self):
+        adapter = KimiAdapter(_cfg())
+        adapter.list_group_members = AsyncMock(  # type: ignore[method-assign]
+            return_value=[{"id": "bot"}, {"id": "user-1"}, {"id": "user-2"}],
+        )
+        self.assertFalse(await adapter._is_dm_room("room-uuid-2"))
+
+    async def test_helper_returns_none_for_rpc_failure(self):
+        from kimi_adapter import KimiTransientError
+        adapter = KimiAdapter(_cfg())
+        adapter.list_group_members = AsyncMock(  # type: ignore[method-assign]
+            side_effect=KimiTransientError("simulated network drop"),
+        )
+        with self.assertLogs("kimi_adapter", level="WARNING") as cm:
+            result = await adapter._is_dm_room("room-uuid-3")
+        self.assertIsNone(result)
+        warning_text = "\n".join(cm.output)
+        self.assertIn("room-uuid-3", warning_text)
+        self.assertIn("DM-autodetect classification failed", warning_text)
+
+    async def test_helper_returns_none_for_timeout(self):
+        adapter = KimiAdapter(_cfg())
+        adapter.list_group_members = AsyncMock(  # type: ignore[method-assign]
+            side_effect=asyncio.TimeoutError(),
+        )
+        with self.assertLogs("kimi_adapter", level="WARNING"):
+            self.assertIsNone(await adapter._is_dm_room("room-uuid-4"))
+
+    async def test_helper_uses_cache_within_ttl(self):
+        # Second call within the 5-minute TTL must NOT issue a fresh RPC.
+        adapter = KimiAdapter(_cfg())
+        adapter.list_group_members = AsyncMock(  # type: ignore[method-assign]
+            return_value=[{"id": "bot"}, {"id": "user-1"}],
+        )
+        self.assertTrue(await adapter._is_dm_room("room-uuid-5"))
+        self.assertEqual(adapter.list_group_members.await_count, 1)
+        self.assertTrue(await adapter._is_dm_room("room-uuid-5"))
+        self.assertEqual(adapter.list_group_members.await_count, 1, "Cache hit must not re-RPC")
+
+    async def test_helper_returns_none_for_degenerate_membership(self):
+        # Defensive: 0 or 1 member shouldn't happen for a room that sent us
+        # a message.  Helper logs a warning and returns None so callers
+        # fall back to existing behaviour rather than over-bypassing.
+        adapter = KimiAdapter(_cfg())
+        adapter.list_group_members = AsyncMock(  # type: ignore[method-assign]
+            return_value=[{"id": "lonely"}],
+        )
+        with self.assertLogs("kimi_adapter", level="WARNING"):
+            self.assertIsNone(await adapter._is_dm_room("room-uuid-6"))
+
+    # ── Mention-gate integration ──────────────────────────────────────────
+
+    async def _make_gated_adapter(self, *, dm_autodetect: bool, members: List[Dict[str, Any]]) -> KimiAdapter:
+        adapter = KimiAdapter(_cfg(
+            group_require_mention=True,
+            kimi_dm_autodetect=dm_autodetect,
+        ))
+        adapter._me_short_id = "u_me"
+        adapter._me_id = "bot-self-id"
+        adapter.handle_message = AsyncMock()  # type: ignore[method-assign]
+        adapter._hydrate_missing_text = False
+        adapter.list_group_members = AsyncMock(return_value=members)  # type: ignore[method-assign]
+        return adapter
+
+    async def test_gate_default_off_unchanged_v21x_behaviour(self):
+        # With kimi_dm_autodetect=False (the v2.2.0 default), a 2-member
+        # room without @-mention is still dropped — proving v2.1.x
+        # semantics are preserved exactly when the flag is off.
+        adapter = await self._make_gated_adapter(
+            dm_autodetect=False,
+            members=[{"id": "bot"}, {"id": "user-1"}],
+        )
+        await adapter._on_group_event(self._build_msg("would-be-dm-room"))
+        adapter.handle_message.assert_not_awaited()
+        # Detector must NOT have been called.
+        adapter.list_group_members.assert_not_awaited()
+
+    async def test_gate_with_flag_on_bypasses_for_detected_dm(self):
+        adapter = await self._make_gated_adapter(
+            dm_autodetect=True,
+            members=[{"id": "bot"}, {"id": "user-1"}],  # 2 members → DM
+        )
+        await adapter._on_group_event(self._build_msg("dm-room-uuid"))
+        adapter.handle_message.assert_awaited_once()
+        adapter.list_group_members.assert_awaited_once_with("dm-room-uuid")
+
+    async def test_gate_with_flag_on_still_drops_for_detected_group(self):
+        adapter = await self._make_gated_adapter(
+            dm_autodetect=True,
+            members=[{"id": "bot"}, {"id": "user-1"}, {"id": "user-2"}],
+        )
+        with self.assertLogs("kimi_adapter", level="INFO") as cm:
+            await adapter._on_group_event(self._build_msg("real-group-uuid"))
+        adapter.handle_message.assert_not_awaited()
+        # The augmented drop log must carry the auto-detect annotation so
+        # operators can correlate drops with classification outcomes.
+        info_records = [r for r in cm.records if r.levelno == logging.INFO]
+        self.assertTrue(
+            any("auto-detect=group" in r.getMessage() for r in info_records),
+            f"expected auto-detect=group annotation, got: {[r.getMessage() for r in cm.records]}",
+        )
+
+    async def test_gate_with_flag_on_falls_back_when_classification_fails(self):
+        # Classifier returns None → log says auto-detect=unknown, message dropped.
+        # Fail-closed behaviour: matches v2.1.x when no explicit exempt exists.
+        from kimi_adapter import KimiTransientError
+        adapter = await self._make_gated_adapter(
+            dm_autodetect=True,
+            members=[],  # unused
+        )
+        adapter.list_group_members = AsyncMock(  # type: ignore[method-assign]
+            side_effect=KimiTransientError("rpc died"),
+        )
+        with self.assertLogs("kimi_adapter", level="INFO") as cm:
+            await adapter._on_group_event(self._build_msg("uncertain-room"))
+        adapter.handle_message.assert_not_awaited()
+        info_records = [r for r in cm.records if r.levelno == logging.INFO]
+        self.assertTrue(
+            any("auto-detect=unknown" in r.getMessage() for r in info_records),
+            f"expected auto-detect=unknown annotation, got: {[r.getMessage() for r in cm.records]}",
+        )
+
+    async def test_gate_with_flag_on_explicit_exempt_still_takes_precedence(self):
+        # An exempt-listed room must skip the detector entirely (fast path).
+        # Proves the detector is the LAST bypass, not a replacement.
+        adapter = KimiAdapter(_cfg(
+            group_require_mention=True,
+            kimi_dm_autodetect=True,
+            kimi_free_response_chats=["explicit-policy-group"],
+        ))
+        adapter._me_short_id = "u_me"
+        adapter.handle_message = AsyncMock()  # type: ignore[method-assign]
+        adapter._hydrate_missing_text = False
+        adapter.list_group_members = AsyncMock()  # type: ignore[method-assign]
+        await adapter._on_group_event(self._build_msg("explicit-policy-group"))
+        adapter.handle_message.assert_awaited_once()
+        # Detector was NOT consulted — the room is in the explicit exempt list.
+        adapter.list_group_members.assert_not_awaited()
+
+    async def test_gate_with_flag_on_mentioned_message_skips_detector(self):
+        # Sanity: mention path short-circuits before the detector.
+        # No RPC, no auto-detect annotation.
+        adapter = await self._make_gated_adapter(
+            dm_autodetect=True,
+            members=[{"id": "bot"}, {"id": "user-1"}],
+        )
+        await adapter._on_group_event(self._build_msg("any-room", with_mention=True))
+        adapter.handle_message.assert_awaited_once()
+        adapter.list_group_members.assert_not_awaited()
+
+
 class ThreadRoutingTests(unittest.IsolatedAsyncioTestCase):
     """Inbound/outbound thread routing preserves thread identity.
 

@@ -2,6 +2,26 @@
 
 All notable changes to `hermes-kimi-plugin`. Format loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); the project uses semver where API contract changes bump major, behavior changes bump minor, and bug fixes bump patch.
 
+## [2.2.0] — 2026-05-18
+
+### Added
+- **`kimi_dm_autodetect` config knob** (default `false`) — auto-bypass the mention gate for rooms structurally identifiable as 1:1 DMs. Kimi delivers DMs as `room:<uuid>` indistinguishable from groups at the wire envelope our adapter consumes, so before this release the only workaround for `group_require_mention=true` swallowing DM traffic was to add each DM's room UUID to `kimi_free_response_chats` manually. With the flag on, the adapter calls `list_group_members` on rooms about to be dropped by the gate; rooms with exactly 2 members (bot + 1 user) bypass without operator config. Off by default for v2.2.0 — opt-in until stabilization in production. After validation, a future release may flip the default.
+- New `_is_dm_room(room_id) -> Optional[bool]` helper at `KimiAdapter`. Returns `True` (2 members → DM), `False` (3+ members → group), or `None` (RPC failure → caller falls back to legacy behaviour). Result cached in `self._rooms[room_id].members` with the same 5-minute TTL as `get_chat_info()`. First call per new room costs one `ListMembers` RPC (≈50-200 ms over WAN to kimi.com); subsequent calls are O(1) until TTL expiry.
+
+### Performance characteristics
+- The detector is the **last bypass chance** in the mention gate — only consulted when the message is otherwise about to be dropped. Messages that already qualify for dispatch (no gate, or @-mentioned, or in the explicit exempt list) never incur the detector RPC. The fast path is unchanged.
+- New `auto-detect=<group|unknown>` annotation appears on the drop-log line when the flag is on, so operators can correlate drops with classification outcomes.
+
+### What is NOT changed
+- `kimi_free_response_chats` semantics are unchanged. The config knob retains both its historical use cases: (1) DM misdetection workaround (now optional once `kimi_dm_autodetect=true`), and (2) explicit operator policy ("this small trusted group room should be free-response despite the global mention gate" — a policy choice no detector can infer). Even when `kimi_dm_autodetect=true`, an explicit exempt-list entry takes precedence over the detector.
+- v2.1.x behaviour is preserved exactly when `kimi_dm_autodetect=false` (the default for v2.2.0). The full test suite includes a regression test (`test_gate_default_off_unchanged_v21x_behaviour`) asserting this — including that the detector RPC is NOT issued at all.
+
+### Context
+- Driven by a three-reviewer audit (Claude code-reviewer + Codex factual auditor + Kimi adversarial challenger) on v2.1.6. Kimi's adversarial review pushed back on the original gap-analysis verdict that the `room:<uuid>` uniform convention was "forced by wire" — pointing out that `list_group_members` (already implemented at L1947) lets us classify rooms structurally. A spike (`.review/b1-room-distinguishability-spike.md`) confirmed the detector is buildable, identified the dual-use-case nature of `kimi_free_response_chats` that Kimi's challenge missed (DM-misdetection workaround is auto-detectable; explicit policy is not), and produced the design that this release implements.
+
+### Tests
+- 12 new tests in `DmAutodetectTests`. 6 cover the `_is_dm_room` helper directly (2-member True / 3+-member False / RPC failure None / timeout None / cache hit avoids re-RPC / degenerate membership None). 6 cover the mention-gate integration (default off preserves v2.1.x semantics including no detector RPC / flag on bypasses for detected DM / flag on still drops for detected group / flag on falls back when classification fails / explicit exempt takes precedence over detector / @-mention short-circuits before detector). Suite: 253/253.
+
 ## [2.1.7] — 2026-05-18
 
 ### Fixed
@@ -111,6 +131,7 @@ All notable changes to `hermes-kimi-plugin`. Format loosely follows [Keep a Chan
 ### Removed
 - Fork-branch dependency. The two PRs this plugin's earlier releases were carrying forward (`hook/platform-adapter-registry` + `feat/platform-kimi-enum`) are retired — Teknium's `register_platform()` is the upstream equivalent and is strictly richer than what they proposed. Historical fork branches are preserved as `archive/*` tags on [`linxule/hermes-agent`](https://github.com/linxule/hermes-agent) for reference.
 
+[2.2.0]: https://github.com/linxule/hermes-kimi-plugin/releases/tag/v2.2.0
 [2.1.7]: https://github.com/linxule/hermes-kimi-plugin/releases/tag/v2.1.7
 [2.1.6]: https://github.com/linxule/hermes-kimi-plugin/releases/tag/v2.1.6
 [2.1.5]: https://github.com/linxule/hermes-kimi-plugin/releases/tag/v2.1.5

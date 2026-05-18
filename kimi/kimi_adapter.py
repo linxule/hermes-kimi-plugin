@@ -1142,6 +1142,24 @@ class KimiAdapter(BasePlatformAdapter):
             if normalised
         )
 
+        # v2.2.0: room-distinguishability via list_group_members.  When True,
+        # the mention gate auto-bypasses rooms that the ListMembers RPC reports
+        # have exactly 2 members (bot + 1 user) — kimi.com delivers 1:1 DMs
+        # as ``room:<uuid>`` indistinguishable from groups at the envelope
+        # layer we consume, so without explicit classification a global
+        # ``group_require_mention=true`` swallows DM traffic.  The detector
+        # replaces use case 1 of ``kimi_free_response_chats`` (DM
+        # misdetection); use case 2 (explicit free-response groups via
+        # operator policy) is NOT auto-detectable and remains served by the
+        # exempt list.  See ``.review/b1-room-distinguishability-spike.md``
+        # for the cost analysis and race-window handling.
+        #
+        # Default OFF for v2.2.0 — opt-in until stabilization.  After
+        # validation in production, a future release may flip the default.
+        self._kimi_dm_autodetect: bool = bool(
+            config.extra.get("kimi_dm_autodetect", False)
+        )
+
         # Short_id / id allowlist — authoritative identity-based bypass of role filter
         trusted = config.extra.get("group_trusted_senders") or []
         self._group_trusted_senders: frozenset[str] = frozenset(
@@ -1897,6 +1915,62 @@ class KimiAdapter(BasePlatformAdapter):
         except Exception as exc:
             logger.exception("Kimi: send failed")
             return SendResult(success=False, error=str(exc), retryable=False)
+
+    async def _is_dm_room(self, room_id: str) -> Optional[bool]:
+        """Classify a Kimi room as DM (2 members) or group (3+).
+
+        Returns:
+            ``True``  — 2 members (bot + 1 user); this is a 1:1 DM.
+            ``False`` — 3+ members; this is a group room.
+            ``None``  — classification failed (RPC error, etc.).  Callers
+                        must fall back to existing behaviour (treat as group).
+
+        Reads / populates ``self._rooms[room_id].members`` with the same 5
+        minute TTL as ``get_chat_info``.  First call per new room costs one
+        ``ListMembers`` RPC (≈50-200 ms over WAN to kimi.com); subsequent
+        calls are O(1) until TTL expiry.
+
+        Background: Kimi delivers 1:1 DMs as ``room:<uuid>`` indistinguishable
+        from group rooms at the wire envelope our adapter consumes — see the
+        v2.1.2 / v2.1.3 release notes for the original debugging episode that
+        produced the ``kimi_free_response_chats`` workaround.  This helper is
+        the v2.2.0 detector that lets us auto-bypass the mention gate for
+        rooms structurally identifiable as DMs without operator config.
+        """
+        cached = self._rooms.get(room_id)
+        if cached is not None and (time.time() - cached.last_refresh_ts) <= 300:
+            members = cached.members
+        else:
+            try:
+                members = await self.list_group_members(room_id)
+            except (KimiAdapterError, asyncio.TimeoutError) as exc:
+                logger.warning(
+                    "Kimi: DM-autodetect classification failed for %s — "
+                    "falling back to exempt-list behaviour: %s",
+                    room_id, exc,
+                )
+                return None
+            # Refresh the cache.  Preserve any existing name (separate RPC).
+            prior_name = cached.name if cached is not None else None
+            self._rooms[room_id] = _ChatInfoCache(
+                room_id=room_id,
+                name=prior_name,
+                members=members,
+                last_refresh_ts=time.time(),
+            )
+        n = len(members)
+        if n == 2:
+            return True
+        if n >= 3:
+            return False
+        # Degenerate (0 or 1 member) — shouldn't happen for a room that
+        # actually sent us a message.  Defensive: log + return None so the
+        # caller falls back to legacy behaviour rather than over-bypassing.
+        logger.warning(
+            "Kimi: room %s has %d members (expected ≥2) — cannot classify",
+            room_id, n,
+        )
+        return None
 
     async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
         """Return ``{"name", "type", "chat_id", "members"?}``."""
@@ -3282,22 +3356,57 @@ class KimiAdapter(BasePlatformAdapter):
             )
 
         # Mention gate: if configured to require mentions and the message
-        # doesn't reference us, ignore. Supports both numeric id and short_id.
-        # Rooms in `kimi_free_response_chats` bypass this — used for 1:1 DMs
-        # (which Kimi delivers as `room:<uuid>` indistinguishable from groups)
-        # and for any group where the user wants free-response behavior despite
-        # the global default.
+        # doesn't reference us, ignore.  Supports both numeric id and
+        # short_id.  Rooms in ``kimi_free_response_chats`` bypass this —
+        # historically used for two purposes:
+        #
+        #   1. Working around DM misdetection (Kimi delivers 1:1 DMs as
+        #      ``room:<uuid>`` indistinguishable from groups at the wire
+        #      envelope we consume).  v2.2.0 introduces the
+        #      ``kimi_dm_autodetect`` flag which auto-bypasses 2-member
+        #      rooms via ``_is_dm_room`` — operators no longer need to
+        #      list DM UUIDs manually when the flag is on.
+        #   2. Explicit operator policy ("this small trusted group room
+        #      should be free-response despite the global mention gate").
+        #      NOT auto-detectable; remains served by
+        #      ``kimi_free_response_chats``.
+        #
+        # The detector is the LAST bypass chance — only consulted if the
+        # other checks already decided to drop.  This preserves the fast
+        # path: messages headed to dispatch never incur the detector RPC,
+        # only messages about to be silenced.
         if (
             self._group_require_mention
             and chat_id not in self._group_require_mention_exempt_rooms
             and not self._is_mention_of_me(msg)
         ):
-            logger.info(
-                "Kimi groups: dropping message %s/%s (group_require_mention=true, no @mention of us)",
-                chat_id,
-                message_id,
-            )
-            return
+            if self._kimi_dm_autodetect:
+                is_dm = await self._is_dm_room(chat_id)
+                if is_dm is True:
+                    logger.debug(
+                        "Kimi groups: auto-detected DM, bypassing mention "
+                        "gate for %s/%s",
+                        chat_id, message_id,
+                    )
+                    # Fall through to dispatch.
+                else:
+                    # is_dm is False (group) or None (classification failed
+                    # — fail closed and let the legacy gate fire).
+                    logger.info(
+                        "Kimi groups: dropping message %s/%s "
+                        "(group_require_mention=true, no @mention, "
+                        "auto-detect=%s)",
+                        chat_id, message_id,
+                        "group" if is_dm is False else "unknown",
+                    )
+                    return
+            else:
+                logger.info(
+                    "Kimi groups: dropping message %s/%s "
+                    "(group_require_mention=true, no @mention of us)",
+                    chat_id, message_id,
+                )
+                return
 
         # Preserve thread identity in the dispatched chat_id so the gateway's
         # session routing keeps distinct threads inside one Kimi room in
