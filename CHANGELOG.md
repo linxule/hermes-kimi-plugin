@@ -2,6 +2,19 @@
 
 All notable changes to `hermes-kimi-plugin`. Format loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); the project uses semver where API contract changes bump major, behavior changes bump minor, and bug fixes bump patch.
 
+## [2.1.7] — 2026-05-18
+
+### Fixed
+- Send-path `KimiAuthError` handler now calls `BasePlatformAdapter._set_fatal_error(code="kimi_send_auth", retryable=True)` before returning the `SendResult`. Without this, a send-time auth failure (token expired mid-session, revoked, account disabled, etc.) returned `SendResult(retryable=False)` to the gateway but did not surface the platform as fatally broken — meaning the upstream per-platform circuit breaker (commit [`518f39557`](https://github.com/NousResearch/hermes-agent/commit/518f39557), May 2026) would keep dispatching new sends against a dead adapter. Silent outage from the operator's perspective. Symmetric with the connect-loop auth paths at `_dm_ws_loop` (line ~2269) and `_group_subscribe_loop` (line ~2680), which already call `_set_fatal_error` on permanent auth failure (rc==3).
+- The `retryable=True` choice (not `False`) at the send-path layer is intentional: a send-time auth failure is ambiguous between a refreshable token expiry and a truly permanent revoke. `retryable=True` lets the gateway's reconnect machinery re-evaluate via the connect-loop's own auth check, which will set `retryable=False` if the new auth attempt also fails (rc==3 in the connect loop). The `SendResult.retryable=False` on the outer return stays unchanged — the gateway's send-retry wrapper must NOT re-attempt the dispatch, because the failure is auth, not network; retry without reconnect would just 401 again.
+
+### Context
+- Surfaced by a three-reviewer audit pass (Claude code-reviewer + Codex factual auditor + Kimi adversarial challenger) on the v2.1.6 patch + the local Kimi-vs-Yuanbao gap analysis. Codex flagged the partial adoption: connect-loop paths use `_set_fatal_error` already, but the send-path was missing. Kimi pushed on the operator-visibility implication (silent outage). Full review artifacts saved to `.review/2026-05-18-{claude,codex,kimi,synthesis}.md` (gitignored, local-scratch only).
+- Codex also corrected the `_set_fatal_error` signature understanding: it's `(self, code: str, message: str, *, retryable: bool)`, with keyword-only `retryable`. The internal docstring + comment use the correct parameter names now.
+
+### Tests
+- 2 new tests in `SendArmExceptionPolicyTests`: `test_auth_error_surfaces_to_fatal_error_hook` (group arm) and `test_auth_error_on_dm_path_also_surfaces_to_fatal_hook` (dm arm). Both assert the `_set_fatal_error` call fires with the documented `code` / `retryable` contract AND that the outer `SendResult.retryable=False` semantics are unchanged. Suite: 241/241.
+
 ## [2.1.6] — 2026-05-18
 
 ### Fixed
@@ -98,6 +111,7 @@ All notable changes to `hermes-kimi-plugin`. Format loosely follows [Keep a Chan
 ### Removed
 - Fork-branch dependency. The two PRs this plugin's earlier releases were carrying forward (`hook/platform-adapter-registry` + `feat/platform-kimi-enum`) are retired — Teknium's `register_platform()` is the upstream equivalent and is strictly richer than what they proposed. Historical fork branches are preserved as `archive/*` tags on [`linxule/hermes-agent`](https://github.com/linxule/hermes-agent) for reference.
 
+[2.1.7]: https://github.com/linxule/hermes-kimi-plugin/releases/tag/v2.1.7
 [2.1.6]: https://github.com/linxule/hermes-kimi-plugin/releases/tag/v2.1.6
 [2.1.5]: https://github.com/linxule/hermes-kimi-plugin/releases/tag/v2.1.5
 [2.1.4]: https://github.com/linxule/hermes-kimi-plugin/releases/tag/v2.1.4

@@ -1011,6 +1011,73 @@ class SendArmExceptionPolicyTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(result.success)
         self.assertFalse(result.retryable)
 
+    async def test_auth_error_surfaces_to_fatal_error_hook(self):
+        # v2.1.7: the send-path KimiAuthError handler must call
+        # ``_set_fatal_error`` so the gateway's per-platform circuit
+        # breaker (upstream commit 518f39557, May 2026) sees the
+        # platform as fatally broken and stops dispatching new sends.
+        # Without this, the gateway would keep accepting send requests
+        # against a dead adapter — silent outage from the operator's
+        # perspective.  retryable=True (not False) at this layer because
+        # send-time auth failures are ambiguous (transient token expiry
+        # vs permanent revoke); reconnect re-evaluates and the connect-
+        # loop fatal hook at ~L2269 / ~L2680 sets retryable=False if the
+        # new auth attempt also fails.
+        from kimi_adapter import KimiAuthError
+        adapter = KimiAdapter(_cfg())
+        adapter._send_group = AsyncMock(
+            side_effect=KimiAuthError("simulated 401 mid-send"),
+        )
+        fatal_calls: list[tuple] = []
+
+        def _record_fatal(code, message, *, retryable):
+            fatal_calls.append((code, message, retryable))
+
+        adapter._set_fatal_error = _record_fatal  # type: ignore[method-assign]
+
+        with self.assertLogs("kimi_adapter", level="ERROR") as cm:
+            result = await adapter.send("room:abc-def", "hello")
+
+        # SendResult contract unchanged: retryable=False so the gateway's
+        # send-retry wrapper does NOT re-attempt the dispatch (the failure
+        # is auth, not network; retry without reconnect would just 401 again).
+        self.assertFalse(result.success)
+        self.assertFalse(result.retryable)
+        self.assertIn("simulated 401 mid-send", result.error)
+
+        # Fatal-error hook was called exactly once with the documented contract.
+        self.assertEqual(len(fatal_calls), 1, fatal_calls)
+        code, message, retryable = fatal_calls[0]
+        self.assertEqual(code, "kimi_send_auth")
+        self.assertIn("simulated 401 mid-send", message)
+        self.assertTrue(retryable, "Send-path fatal must be retryable so reconnect re-evaluates")
+
+        # ERROR log carries the chat_id for operator triage.
+        log_text = "\n".join(cm.output)
+        self.assertIn("room:abc-def", log_text)
+        self.assertIn("marking platform", log_text.lower())
+
+    async def test_auth_error_on_dm_path_also_surfaces_to_fatal_hook(self):
+        # Dispatcher-level coverage: send()'s try/except wraps both
+        # _send_dm and _send_group, so a KimiAuthError from either arm
+        # must funnel through the same _set_fatal_error call.
+        from kimi_adapter import KimiAuthError
+        adapter = KimiAdapter(_cfg())
+        adapter._send_dm = AsyncMock(
+            side_effect=KimiAuthError("simulated 401 on dm arm"),
+        )
+        fatal_calls: list[tuple] = []
+        adapter._set_fatal_error = lambda code, message, *, retryable: fatal_calls.append(  # type: ignore[method-assign]
+            (code, message, retryable)
+        )
+
+        with self.assertLogs("kimi_adapter", level="ERROR"):
+            result = await adapter.send("dm:im:kimi:main", "hello")
+
+        self.assertFalse(result.retryable)
+        self.assertEqual(len(fatal_calls), 1)
+        self.assertEqual(fatal_calls[0][0], "kimi_send_auth")
+
     async def test_dm_path_timeout_also_non_retryable(self):
         # Dispatcher-level coverage: send()'s try/except at kimi_adapter.py:1809
         # wraps BOTH the _send_dm and _send_group dispatch arms.  This test

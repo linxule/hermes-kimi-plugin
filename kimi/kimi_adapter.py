@@ -1837,6 +1837,33 @@ class KimiAdapter(BasePlatformAdapter):
                 retryable=False,
             )
         except KimiAuthError as exc:
+            # Send-path auth failure (token expired mid-session, revoked, etc.)
+            # — surface via runtime status so the gateway's per-platform
+            # circuit breaker (upstream commit 518f39557, May 2026) sees the
+            # platform as fatally broken and stops dispatching new sends
+            # against this adapter.  Symmetric with the connect-loop auth
+            # paths at _dm_ws_loop (≈L2269) and _group_subscribe_loop
+            # (≈L2680), which already call _set_fatal_error on permanent
+            # auth failure (rc==3).  Without this, the gateway would keep
+            # accepting send requests against a dead adapter — silent
+            # outage from the operator's perspective.
+            #
+            # retryable=True (not False) because a send-time auth failure
+            # is ambiguous: it might be a refreshable token expiry or a
+            # truly permanent revoke.  Let the reconnect machinery decide:
+            # the connect attempt either succeeds (transient was real) or
+            # hits the rc==3 path and re-fires _set_fatal_error with
+            # retryable=False for the permanent case.
+            logger.error(
+                "Kimi: send-time auth failure on %s — marking platform "
+                "fatal (retryable, reconnect will re-evaluate): %s",
+                chat_id, exc,
+            )
+            self._set_fatal_error(
+                "kimi_send_auth",
+                f"Kimi: send-time auth failure: {exc}",
+                retryable=True,
+            )
             return SendResult(success=False, error=str(exc), retryable=False)
         except asyncio.TimeoutError:
             # Kimi.com server occasionally accepts a SendMessage POST internally
