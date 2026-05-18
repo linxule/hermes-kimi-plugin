@@ -98,6 +98,7 @@ All notable changes to `hermes-kimi-plugin`. Format loosely follows [Keep a Chan
 ### Removed
 - Fork-branch dependency. The two PRs this plugin's earlier releases were carrying forward (`hook/platform-adapter-registry` + `feat/platform-kimi-enum`) are retired — Teknium's `register_platform()` is the upstream equivalent and is strictly richer than what they proposed. Historical fork branches are preserved as `archive/*` tags on [`linxule/hermes-agent`](https://github.com/linxule/hermes-agent) for reference.
 
+[2.1.6]: https://github.com/linxule/hermes-kimi-plugin/releases/tag/v2.1.6
 [2.1.5]: https://github.com/linxule/hermes-kimi-plugin/releases/tag/v2.1.5
 [2.1.4]: https://github.com/linxule/hermes-kimi-plugin/releases/tag/v2.1.4
 [2.1.3]: https://github.com/linxule/hermes-kimi-plugin/releases/tag/v2.1.3

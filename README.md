@@ -50,6 +50,10 @@ cp -r /tmp/hermes-kimi-plugin/kimi "$HERMES_HOME/plugins/kimi"
 
 Note: pip-installable distribution is intentionally NOT supported — the `pyproject.toml` ships a metadata-only wheel. The plugin code doesn't belong in `site-packages` (the loader doesn't discover from there, and a flat-wheel layout would clash with other packages). Pip path is deferred until upstream documents a site-packages plugin-discovery convention.
 
+### Behind a corporate / institutional proxy (v2.1.6+)
+
+If you run the gateway behind an HTTP proxy (corporate network, institutional firewall, anything that requires `HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY` env vars), the plugin honours those env vars automatically from v2.1.6 onwards via `aiohttp`'s `trust_env=True`. On v2.1.5 and earlier the plugin silently bypassed the proxy and outbound requests to `kimi.com` failed with bare connection errors. If you see "cannot connect to kimi.com" symptoms on a network that requires a proxy, upgrade.
+
 ### Configure
 
 Add to `$HERMES_HOME/config.yaml`:
