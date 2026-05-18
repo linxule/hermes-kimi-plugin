@@ -1451,7 +1451,15 @@ class KimiAdapter(BasePlatformAdapter):
 
         self._closing = False
         self._startup_ts = time.time()
-        self._http_session = aiohttp.ClientSession()
+        # trust_env=True so that HTTP_PROXY / HTTPS_PROXY / ALL_PROXY env
+        # vars are honoured. aiohttp's default is False, which silently
+        # ignores them and breaks corporate-proxy deployments. Symmetric
+        # with the in-tree Yuanbao / WeCom / Weixin / Matrix adapters and
+        # with the SMS / Slack / Teams / Google-Chat sweep that landed
+        # upstream in commit c1ae18ee8.  Must be re-applied at EVERY
+        # ClientSession() construction site below; aiohttp does not pick
+        # this up from a module-level default.
+        self._http_session = aiohttp.ClientSession(trust_env=True)
         self._http_session_loop = asyncio.get_running_loop()
 
         # Belt-and-braces sweep of parallel TTL state at the start of
@@ -1621,13 +1629,14 @@ class KimiAdapter(BasePlatformAdapter):
         cached = self._http_session
         if cached is None:
             # First-ever lazy creation — cache on the current loop.
-            self._http_session = aiohttp.ClientSession()
+            # See ``connect()`` for the trust_env=True rationale.
+            self._http_session = aiohttp.ClientSession(trust_env=True)
             self._http_session_loop = current_loop
             yield self._http_session
             return
         if getattr(cached, "closed", False):
             # Stale closed session — replace on the current loop.
-            self._http_session = aiohttp.ClientSession()
+            self._http_session = aiohttp.ClientSession(trust_env=True)
             self._http_session_loop = current_loop
             yield self._http_session
             return
@@ -1639,7 +1648,7 @@ class KimiAdapter(BasePlatformAdapter):
             yield cached
             return
         # Cross-loop: ephemeral session scoped to this call.
-        async with aiohttp.ClientSession() as ephemeral:
+        async with aiohttp.ClientSession(trust_env=True) as ephemeral:
             yield ephemeral
 
     async def _cleanup_http(self) -> None:
@@ -3847,7 +3856,8 @@ async def send_kimi_message(
         ),
     ))
     try:
-        async with aiohttp.ClientSession() as session:
+        # trust_env=True: see KimiAdapter.connect() for rationale.
+        async with aiohttp.ClientSession(trust_env=True) as session:
             if media_paths:
                 uploaded = await _upload_kimi_files(
                     session,

@@ -2,6 +2,17 @@
 
 All notable changes to `hermes-kimi-plugin`. Format loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); the project uses semver where API contract changes bump major, behavior changes bump minor, and bug fixes bump patch.
 
+## [2.1.6] — 2026-05-18
+
+### Fixed
+- All five `aiohttp.ClientSession` construction sites in the adapter (the persistent session in `connect()`, three lazy/replacement/ephemeral sites inside `_session_for_current_loop()`, and the standalone `send_kimi_message()` helper) now set `trust_env=True`. aiohttp's default is `False`, which silently ignores `HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY` environment variables — users behind a corporate or institutional proxy could not reach kimi.com via this plugin. Symmetric with the in-tree Yuanbao / WeCom / Weixin / Matrix adapters and with upstream commit [`c1ae18ee8`](https://github.com/NousResearch/hermes-agent/commit/c1ae18ee8) (the SMS / Slack / Teams / Google-Chat sweep, 2026-05-16). An inline comment at the `connect()` site explains the rationale and warns future maintainers that the flag must be re-applied at every construction site — aiohttp does not pick it up from a module-level default.
+
+### Context
+- Discovered during an upstream-sync survey of `NousResearch/hermes-agent` since v0.13.0 (commit `3633c8690`, ~487 commits in the window). The trust_env sweep was the one mechanical patch from that survey; the gateway-side hardening (per-platform circuit breaker `518f39557`, `safe_schedule_threadsafe` helper `4e89c5308`, cron parallel-job-result fix `7a7e78a36`) is automatic benefit with no plugin-side change required. The `tools/send_message_tool.py` dispatch contract is unchanged in the window, so the README's `tool_only + send_message_tool` known-limitation section remains accurate. Full survey + a Kimi-vs-Yuanbao gap analysis live in `.review/` (gitignored).
+
+### Tests
+- 5 new tests in `ProxyTrustEnvTests` covering all five construction sites: persistent (`connect()`), lazy/replacement/cross-loop (`_session_for_current_loop`), and standalone (`send_kimi_message`). Suite: 239/239.
+
 ## [2.1.5] — 2026-05-17
 
 ### Fixed

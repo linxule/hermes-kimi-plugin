@@ -6,7 +6,7 @@ Bridges Hermes Agent gateways to a single Kimi bot identity, handling **direct m
 
 ## Status
 
-Current version: **2.1.5**. Targets vanilla upstream `NousResearch/hermes-agent` ≥ 0.13.0 (uses `ctx.register_platform()` and `apply_yaml_config_fn`). See [CHANGELOG.md](CHANGELOG.md) for the full release history.
+Current version: **2.1.6**. Targets vanilla upstream `NousResearch/hermes-agent` ≥ 0.13.0 (uses `ctx.register_platform()` and `apply_yaml_config_fn`). See [CHANGELOG.md](CHANGELOG.md) for the full release history.
 
 Production reference: the plugin has been running continuously on a long-lived Raspberry Pi deployment since 2026-04-27, first against a fork branch and now against vanilla upstream `main`. Gateway log lines like `Plugin 'kimi' registered platform: kimi` and `hermes_plugins.kimi.kimi_adapter: Kimi: connected as <bot-name>` confirm the plugin path is active end-to-end.
 

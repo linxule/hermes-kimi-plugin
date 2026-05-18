@@ -600,6 +600,156 @@ class CrossLoopSessionTests(unittest.TestCase):
         asyncio.run(scenario())
 
 
+class ProxyTrustEnvTests(unittest.IsolatedAsyncioTestCase):
+    """Every ``aiohttp.ClientSession`` constructed by this plugin must set
+    ``trust_env=True`` so that ``HTTP_PROXY`` / ``HTTPS_PROXY`` / ``ALL_PROXY``
+    are honoured.  aiohttp's default is ``False``, which silently routes
+    traffic around the user's proxy and breaks corporate-network deployments.
+
+    Symmetric with the in-tree Yuanbao / WeCom / Weixin / Matrix adapters and
+    with upstream commit ``c1ae18ee8`` (the SMS / Slack / Teams / Google-Chat
+    sweep).  Tests intentionally cover all five construction sites so a
+    refactor cannot silently drop the flag at one of them.
+    """
+
+    def _assert_trust_env(self, mock_session_cls) -> None:
+        """All calls to the mock ClientSession ctor must include trust_env=True."""
+        self.assertTrue(
+            mock_session_cls.called,
+            "Expected aiohttp.ClientSession to be constructed at least once",
+        )
+        for call in mock_session_cls.call_args_list:
+            _args, kwargs = call
+            self.assertTrue(
+                kwargs.get("trust_env") is True,
+                f"ClientSession constructed without trust_env=True: {call!r}",
+            )
+
+    async def test_connect_persistent_session_sets_trust_env(self):
+        # Strategy: patch aiohttp.ClientSession to RAISE after recording the
+        # call. connect() will bail at the session-construction line, but the
+        # mock has already captured kwargs by then. Avoids having to mock the
+        # full WS/RPC stack.
+        adapter = KimiAdapter(_cfg())
+        adapter._bot_token = "test-token"
+        sentinel_exc = RuntimeError("test exit after session ctor")
+        with patch("kimi_adapter.aiohttp.ClientSession", side_effect=sentinel_exc) as mock_session_cls, \
+             patch.object(adapter, "_acquire_platform_lock", return_value=True), \
+             patch("kimi_adapter.check_kimi_requirements", return_value=True):
+            try:
+                await adapter.connect()
+            except RuntimeError as exc:
+                if exc is not sentinel_exc:
+                    raise
+            self._assert_trust_env(mock_session_cls)
+
+    async def test_session_for_current_loop_lazy_creation_sets_trust_env(self):
+        adapter = KimiAdapter(_cfg())
+        self.assertIsNone(adapter._http_session)
+        with patch("kimi_adapter.aiohttp.ClientSession") as mock_session_cls:
+            # Make the mock instance look like a live, unclosed session so
+            # the cross-loop branch doesn't try to close it on cleanup.
+            mock_session_cls.return_value.closed = False
+            mock_session_cls.return_value.close = AsyncMock()
+            async with adapter._session_for_current_loop():
+                pass
+            self._assert_trust_env(mock_session_cls)
+
+    async def test_session_for_current_loop_stale_closed_replacement_sets_trust_env(self):
+        adapter = KimiAdapter(_cfg())
+        # Seed a fake closed session bound to a different loop so the helper
+        # takes the "stale closed" branch.
+        stale = MagicMock()
+        stale.closed = True
+        adapter._http_session = stale
+        adapter._http_session_loop = None
+        with patch("kimi_adapter.aiohttp.ClientSession") as mock_session_cls:
+            mock_session_cls.return_value.closed = False
+            mock_session_cls.return_value.close = AsyncMock()
+            async with adapter._session_for_current_loop():
+                pass
+            self._assert_trust_env(mock_session_cls)
+
+    def test_session_for_current_loop_cross_loop_ephemeral_sets_trust_env(self):
+        # Cross-loop branch requires two real event loops, mirroring
+        # test_cross_loop_yields_ephemeral_session.
+        adapter = KimiAdapter(_cfg())
+        loop_a = asyncio.new_event_loop()
+        try:
+            # Seed a real session on loop_a so the cached-session check passes.
+            async def seed():
+                async with adapter._session_for_current_loop() as s:
+                    return s
+            loop_a.run_until_complete(seed())
+            self.assertIs(adapter._http_session_loop, loop_a)
+
+            # Now exercise loop_b with the constructor patched.
+            loop_b = asyncio.new_event_loop()
+            try:
+                with patch("kimi_adapter.aiohttp.ClientSession") as mock_session_cls:
+                    mock_session_cls.return_value.closed = False
+                    mock_session_cls.return_value.close = AsyncMock()
+                    mock_session_cls.return_value.__aenter__ = AsyncMock(
+                        return_value=mock_session_cls.return_value,
+                    )
+                    mock_session_cls.return_value.__aexit__ = AsyncMock(return_value=None)
+                    async def use_on_loop_b():
+                        async with adapter._session_for_current_loop():
+                            pass
+                    loop_b.run_until_complete(use_on_loop_b())
+                    self._assert_trust_env(mock_session_cls)
+            finally:
+                loop_b.close()
+        finally:
+            if adapter._http_session is not None and not adapter._http_session.closed:
+                loop_a.run_until_complete(adapter._http_session.close())
+            loop_a.close()
+
+    async def test_standalone_send_kimi_message_session_sets_trust_env(self):
+        # Exercise the module-level send_kimi_message() helper used by cron
+        # and by send_message_tool fallbacks. Use the same _FakeSessionFactory
+        # pattern as SendKimiMessageStandalonePolicyTests so we don't depend
+        # on the real network or a specific response shape.
+        cfg = PlatformConfig(
+            enabled=True,
+            token="km_b_prod_TRUST_ENV_STANDALONE_TEST",
+            extra={"enable_groups": True},
+        )
+
+        class _BailPostCtx:
+            async def __aenter__(self_inner):
+                raise RuntimeError("test exit after post()")
+
+            async def __aexit__(self_inner, *exc):
+                return False
+
+        fake_session = MagicMock()
+        fake_session.post = MagicMock(return_value=_BailPostCtx())
+
+        class _FakeSessionFactory:
+            async def __aenter__(self_inner):
+                return fake_session
+
+            async def __aexit__(self_inner, *exc):
+                return False
+
+        with patch(
+            "kimi_adapter.aiohttp.ClientSession",
+            return_value=_FakeSessionFactory(),
+        ) as mock_session_cls:
+            try:
+                await send_kimi_message(
+                    cfg,
+                    chat_id="room:00000000-0000-0000-0000-000000000000",
+                    text="hello",
+                )
+            except Exception:
+                # post() raises by design; we only care that the
+                # ClientSession constructor recorded trust_env=True.
+                pass
+            self._assert_trust_env(mock_session_cls)
+
+
 class AdapterInitTests(unittest.TestCase):
     def test_config_parsing(self):
         cfg = _cfg(
