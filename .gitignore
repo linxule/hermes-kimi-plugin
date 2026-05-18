@@ -44,3 +44,7 @@ env/
 # OS
 .DS_Store
 Thumbs.db
+
+# Local review/working notes (cross-reviewer artifacts, design sketches,
+# patch dumps). Personal to the maintainer's workflow, not project assets.
+.review/
