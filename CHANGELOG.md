@@ -2,6 +2,19 @@
 
 All notable changes to `hermes-kimi-plugin`. Format loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); the project uses semver where API contract changes bump major, behavior changes bump minor, and bug fixes bump patch.
 
+## [2.2.1] — 2026-05-18
+
+### Changed
+- **Required hermes-agent floor bumped to `>=0.14.0`** (was `>=0.13.0`). v0.14.0 (the Foundation Release, upstream tag `v2026.5.16` / commit `a91a57fa5`) is now the minimum. No code adaptation required — investigation against the v0.13→v0.14 diff window confirmed `_set_fatal_error` signature unchanged, `trust_env=True` is the established upstream pattern (matches our v2.1.6), `standalone_sender_fn` semantics unchanged, and no API affecting our v2.1.6/v2.1.7/v2.2.0 work moved.
+- Install path: as of release date the v0.14.0 wheel has not yet been published to PyPI (upstream auto-publish appears pending). `[tool.uv.sources]` in `pyproject.toml` pins the git tag `v2026.5.16` for our dev installs; the README documents both the git-source install (works today) and the future `pip install 'hermes-agent>=0.14.0'` invocation (once PyPI catches up).
+
+### Verified
+- Full test suite (253/253) passes against hermes-agent v0.14.0.
+- Cross-platform compendium (`.review/cross-platform/{wecom,discord,matrix,teams}.md`) validates that our v2.1.6 (`trust_env=True`) and v2.1.4 (`retryable=False` for `TimeoutError`) postures match the established Hermes-wide pattern. Detailed investigation in `.review/v0.14.0-sync-impact.md`.
+
+### Context
+- Investigation surfaced two upstream improvement candidates worth tracking but not yet filed: env-template `${VAR}` resolution for external-plugin `PlatformConfig.token` (currently unresolved across the entire Hermes platform layer), and dispatch-precedence handling in `send_message_tool._send_via_adapter` for plugins with stateful pooled resources (Kimi is the only surveyed adapter with this shape). Both are in the v2.3.0+ planning horizon; see `.review/2026-05-18-post-compaction-synthesis.md` and the reviewer pre-filing audit notes for design discussion.
+
 ## [2.2.0] — 2026-05-18
 
 ### Added
@@ -131,6 +144,7 @@ All notable changes to `hermes-kimi-plugin`. Format loosely follows [Keep a Chan
 ### Removed
 - Fork-branch dependency. The two PRs this plugin's earlier releases were carrying forward (`hook/platform-adapter-registry` + `feat/platform-kimi-enum`) are retired — Teknium's `register_platform()` is the upstream equivalent and is strictly richer than what they proposed. Historical fork branches are preserved as `archive/*` tags on [`linxule/hermes-agent`](https://github.com/linxule/hermes-agent) for reference.
 
+[2.2.1]: https://github.com/linxule/hermes-kimi-plugin/releases/tag/v2.2.1
 [2.2.0]: https://github.com/linxule/hermes-kimi-plugin/releases/tag/v2.2.0
 [2.1.7]: https://github.com/linxule/hermes-kimi-plugin/releases/tag/v2.1.7
 [2.1.6]: https://github.com/linxule/hermes-kimi-plugin/releases/tag/v2.1.6

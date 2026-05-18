@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "hermes-kimi-plugin"
-version = "2.2.0"
+version = "2.2.1"
 description = "Kimi (kimi.com / Moonshot AI) chat platform adapter for Hermes Agent — DM + group rooms under one bot identity. Uses upstream ctx.register_platform() API."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -28,12 +28,12 @@ classifiers = [
 # declaration, project URLs) only — there's no build-system section because
 # this plugin is NOT pip-installable. See the wheel-target NOTE below.
 dependencies = [
-    # v2.0.0 (this release): uses upstream's canonical platform-plugin API
-    # introduced by Teknium's 2e20f6ae2 (plugin platform parity, v0.11.0)
-    # and the apply_yaml_config_fn registry hook in 3633c8690 (v0.13.0).
-    # The closed Platform enum's _missing_ classmethod auto-creates a
-    # pseudo-member for plugin names, so no upstream patches are needed.
-    "hermes-agent>=0.13.0",
+    # v2.2.1 (this release): requires upstream v0.14.0 (Foundation Release).
+    # v0.14.0 is tagged in git (v2026.5.16 / a91a57fa5) but the PyPI wheel
+    # has not been published yet — the ``[tool.uv.sources]`` block below
+    # pins the git tag for dev installs. End users who install hermes-agent
+    # separately should follow upstream README until v0.14.0 lands on PyPI.
+    "hermes-agent>=0.14.0",
     "websockets>=12.0",
     "aiohttp>=3.9.0",
 ]
@@ -85,3 +85,6 @@ asyncio_mode = "auto"
 # pick up the repo-root ``__init__.py`` (which is for the Hermes plugin loader,
 # not pytest) and fail on the relative imports inside register().
 addopts = "--import-mode=importlib"
+
+[tool.uv.sources]
+hermes-agent = { git = "https://github.com/NousResearch/hermes-agent.git", rev = "v2026.5.16" }

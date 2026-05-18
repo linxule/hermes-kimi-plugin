@@ -6,7 +6,7 @@ Bridges Hermes Agent gateways to a single Kimi bot identity, handling **direct m
 
 ## Status
 
-Current version: **2.2.0**. Targets vanilla upstream `NousResearch/hermes-agent` ≥ 0.13.0 (uses `ctx.register_platform()` and `apply_yaml_config_fn`). See [CHANGELOG.md](CHANGELOG.md) for the full release history.
+Current version: **2.2.1**. Targets vanilla upstream `NousResearch/hermes-agent` ≥ 0.14.0 (uses `ctx.register_platform()` and `apply_yaml_config_fn`). See [CHANGELOG.md](CHANGELOG.md) for the full release history.
 
 Production reference: the plugin has been running continuously on a long-lived Raspberry Pi deployment since 2026-04-27, first against a fork branch and now against vanilla upstream `main`. Gateway log lines like `Plugin 'kimi' registered platform: kimi` and `hermes_plugins.kimi.kimi_adapter: Kimi: connected as <bot-name>` confirm the plugin path is active end-to-end.
 
@@ -18,13 +18,21 @@ You'll need:
 
 ### Install Hermes Agent
 
-Vanilla upstream `hermes-agent` ≥ 0.13.0 is sufficient. Both prerequisites (`ctx.register_platform()` + `apply_yaml_config_fn`) are upstream:
+Vanilla upstream `hermes-agent` ≥ 0.14.0 is sufficient. Both prerequisites (`ctx.register_platform()` + `apply_yaml_config_fn`) are upstream.
+
+v0.14.0 (the Foundation Release, tag `v2026.5.16`) is the floor. As of 2026-05-18 the v0.14.0 wheel has not yet been published to PyPI — until that lands, install from the git tag:
 
 ```bash
-pip install 'hermes-agent>=0.13.0'
+pip install 'hermes-agent @ git+https://github.com/NousResearch/hermes-agent.git@v2026.5.16'
 ```
 
-Or install from upstream main directly:
+Once v0.14.0 reaches PyPI:
+
+```bash
+pip install 'hermes-agent>=0.14.0'
+```
+
+Or always install from upstream main directly:
 
 ```bash
 pip install 'hermes-agent @ git+https://github.com/NousResearch/hermes-agent.git@main'
@@ -360,7 +368,7 @@ Recovery designs (Phase 1+) require a release cycle of this data first to choose
 ## Tests
 
 ```bash
-# Install hermes-agent from upstream main (v0.13.0+ is the floor — see pyproject.toml):
+# Install hermes-agent from upstream main (v0.14.0+ is the floor — see pyproject.toml):
 pip install 'hermes-agent @ git+https://github.com/NousResearch/hermes-agent.git@main'
 
 # Install plugin dev deps (pytest etc.) — the plugin itself is NOT pip-installed,

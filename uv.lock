@@ -543,8 +543,8 @@ wheels = [
 
 [[package]]
 name = "hermes-agent"
-version = "0.13.0"
-source = { registry = "https://pypi.org/simple" }
+version = "0.14.0"
+source = { git = "https://github.com/NousResearch/hermes-agent.git?rev=v2026.5.16#a91a57fa5a13d516c38b07a141a9ce8a3daabeb0" }
 dependencies = [
     { name = "croniter" },
     { name = "fire" },
@@ -563,14 +563,10 @@ dependencies = [
     { name = "tenacity" },
     { name = "tzdata", marker = "sys_platform == 'win32'" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/c2/20/f4d705977262468f04ac0f183241150a56b0f615f8496b3c90927faf204e/hermes_agent-0.13.0.tar.gz", hash = "sha256:94d7718507eb88cbf2c065347ac884b3dbb770102235f68f06bd2cc79160b812", size = 7578475, upload-time = "2026-05-14T18:49:32.202Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/c3/4e/c8b550f50aab36b047aff5a11a405138d1676f8cd4575817ffe6c21da226/hermes_agent-0.13.0-py3-none-any.whl", hash = "sha256:e11a8c57c1f57d9a1319ada006889ecde8ed8179c4f8f57af79c65de0033be11", size = 4110416, upload-time = "2026-05-14T18:49:29.771Z" },
-]
 
 [[package]]
 name = "hermes-kimi-plugin"
-version = "2.2.0"
+version = "2.2.1"
 source = { editable = "." }
 dependencies = [
     { name = "aiohttp" },
@@ -588,7 +584,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "aiohttp", specifier = ">=3.9.0" },
-    { name = "hermes-agent", specifier = ">=0.13.0" },
+    { name = "hermes-agent", git = "https://github.com/NousResearch/hermes-agent.git?rev=v2026.5.16" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.0" },
     { name = "pytest-asyncio", marker = "extra == 'dev'", specifier = ">=0.21" },
     { name = "pyyaml", marker = "extra == 'dev'", specifier = ">=6.0" },
