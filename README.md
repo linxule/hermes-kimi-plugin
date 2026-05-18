@@ -6,25 +6,9 @@ Bridges Hermes Agent gateways to a single Kimi bot identity, handling **direct m
 
 ## Status
 
-> **v2.1.5 (2026-05-17) — extend duplicate-send fix to the standalone path; remove private-link leak.** Round-4 audit (Codex + code-reviewer + kimi-challenge) caught two issues blocking upstream-PR readiness. (1) v2.1.4's `asyncio.TimeoutError → retryable=False` policy only covered the live `send()` arm; `send_kimi_message()` (the standalone helper used by cron delivery and `send_message_tool` when no live adapter is available) caught only `aiohttp.ClientError`, so bare TimeoutError propagated uncaught and could duplicate-deliver via cron retry layers. v2.1.5 adds the same `except asyncio.TimeoutError` clause to the standalone path with matching WARNING + `retryable=False` semantics, plus regression tests in `SendKimiMessageStandalonePolicyTests`. (2) Replaced a leaked private-repo link in the `tool_only` section with a generic placeholder (the upstream issue isn't filed yet, so no link to add). Suite: 234/234.
->
-> **v2.1.4 (2026-05-17) — duplicate-send fix: mark client-side `TimeoutError` non-retryable.** Production diagnostic at 18:46:03-18:46:37 BST captured the duplicate-send mechanism: kimi.com's server occasionally accepts a `SendMessage` POST internally but holds the HTTP response on that specific TCP connection, causing aiohttp's `ClientTimeout(total=30)` to fire client-side at exactly 30s. The previous policy grouped `asyncio.TimeoutError` with `KimiTransientError` in `send()`'s except chain and returned `retryable=True` — so the gateway's retry wrapper would re-POST the same SendMessage on a fresh connection, and kimi.com would deliver it again (user-visible duplicate). The diagnostic ruled out event-loop, session, and connection-pool issues: a concurrent SendMessage on the same adapter / same session completed in 697 ms during the same 30s hang window. This release splits the except clause so `asyncio.TimeoutError` returns `retryable=False` with a WARNING log; `KimiTransientError` keeps its `retryable=True` contract for genuine network failures. Trade-off: timeouts now occasionally drop a reply if the server didn't actually deliver (rare per the diagnostic), in exchange for eliminating duplicate-delivery for the common case. 4 new tests in `SendArmExceptionPolicyTests`. Suite: 232/232.
->
-> **v2.1.3 (2026-05-17) — hotfix: normalise `kimi_free_response_chats` entries to wire-shape.** v2.1.2 deployed to Bloom with `kimi_free_response_chats: [room:19e31a29-...]` (the README-documented prefix form, matching `KIMI_HOME_CHANNEL` convention) — but the mention gate's `chat_id` variable in `_on_group_event` reads `chatId` directly from the subscribe-stream envelope, which arrives as a **raw UUID with no `room:` prefix**. The set-membership check `chat_id not in self._group_require_mention_exempt_rooms` therefore never matched: the set held prefixed strings, the wire delivered raw ones. The exempt list was loaded correctly but silently never fired in production. This release normalises entries at load time (strips an optional `room:` prefix) so both the documented prefixed form and the raw-UUID form work, and the in-memory set comparison reflects what `_on_group_event` actually sees. 1 new regression test (`test_exempt_entries_strip_room_prefix`), 2 existing tests updated to reflect normalisation behavior. Discovered via live retest on the Pi at 18:23:49 BST — the dropping log line showed `chat_id=19e31a29-...` without prefix, immediately pinpointing the format mismatch.
->
-> **v2.1.2 (2026-05-17) — `kimi_free_response_chats` exempt list for the mention gate.** Setting `group_require_mention=true` globally previously swallowed DM traffic because Kimi delivers 1:1 conversations as `room:<uuid>` indistinguishable from group rooms at the wire level. This release adds a Matrix/DingTalk-style per-chat allowlist (`kimi_free_response_chats`) so the user can require @-mentions in groups while keeping the DM free-response. Also accepts `group_require_mention_exempt_rooms` as an explicit alias. 7 new tests in `MentionGateExemptionTests`. See "Group participation" section below for the recommended config patterns including how this interacts with Kimi's platform-level "restricted vs. open visibility mode" routing. **Also**: hardened the `_install_fake_session` test fixture to pin `session.closed = False`, plugging a latent v2.1.1 issue where every backoff-test session was being silently replaced with a real `aiohttp.ClientSession()` because `MagicMock().closed` is truthy by default. The cross-loop helper's `getattr(cached, "closed", False)` check is correct for production (real aiohttp `.closed` is a proper bool); the fixture just needed to match that contract. Suite now 227/227 in <1s, up from 220 tests with intermittent timeouts.
->
-> **v2.1.1 (2026-05-17) — cross-loop aiohttp session workaround.** v2.1.0 wired the `send_message` tool path for Kimi targets for the first time, which surfaced a latent cross-event-loop bug: `KimiAdapter.connect()` creates `self._http_session` on the gateway's main event loop, but Hermes's `send_message_tool` dispatches `adapter.send()` from a worker-thread event loop via `_run_async` → `worker_loop.run_until_complete`. aiohttp binds `ClientSession` to whichever loop is running at `__init__` time; using the session from a different loop later raises `RuntimeError("Timeout context manager should be used inside a task")` because `asyncio.current_task(loop=session._loop)` returns `None` from the worker loop. This release adds a `_session_for_current_loop()` async-context-manager helper that yields the cached session when the current loop matches and an ephemeral session bound to the current loop otherwise (connection-pool reuse preserved for normal traffic; single-connection cost on cross-loop calls). All five session call sites refactored. 4 new regression tests for `CrossLoopSessionTests`. An upstream issue tracks the broader fix in `tools/send_message_tool.py` — once landed, this plugin-side workaround becomes redundant but stays safe (idempotent when loops match).
->
-> **v2.1.0 (2026-05-17) — out-of-process cron delivery + top-level YAML config bridge.** Three changes: (1) wired `standalone_sender_fn=_standalone_send` into `register()` so cron jobs and `send_message_tool` can deliver to Kimi rooms without a live in-process adapter (e.g. when cron runs in a separate process from the gateway); (2) fixed `env_enablement_fn` to seed `home_channel` as a dict (`{"chat_id": ..., "name": ...}`) matching upstream's `HomeChannel` contract — the previous string form silently failed the `isinstance(home, dict)` check in `gateway/config.py:1855-1871`, so cron home-channel delivery never worked despite `KIMI_HOME_CHANNEL` being set; (3) corrected `apply_yaml_config_fn` docstring + README to reflect that the bridge reads a **top-level `kimi:` block** (per `yaml_cfg.get(entry.name)` in `gateway/config.py:871`), not `platforms.kimi.*`. 5 new tests for the wrapper contract + end-to-end YAML→env→`HomeChannel` integration tests. All 216 tests pass.
->
-> **v2.0.1 (2026-05-16) — `${VAR}` env-template resolution now also covers the standalone send path.** v2.0.0 wrapped the live-adapter `__init__` chain in a defensive `_resolve_env_template` helper so a `token: ${KIMI_BOT_TOKEN}` config.yaml line would resolve correctly even though Hermes does not invoke env-substitution for external-plugin `PlatformConfig.token`. Code review surfaced that the standalone `send_kimi_message()` helper (used by cron delivery and `send_message_tool` when no live adapter is available) still read `config.token` directly — meaning cron-driven kimi deliveries would 401 silently against a `${VAR}` config while the live bot path worked fine. This release wraps that path identically, adds 2 regression tests for the standalone surface, and hardens the existing adapter-init test against shell-env leakage by asserting on a UUID-derived sentinel.
->
-> **v2.0.0 — runs against vanilla upstream Hermes Agent.** Teknium shipped the canonical platform-plugin API in commit [`2e20f6ae2`](https://github.com/NousResearch/hermes-agent/commit/2e20f6ae2) ("feat: complete plugin platform parity — all 12 integration points", v0.11.0, 2026-04-11) and the YAML-config bridge in [`3633c8690`](https://github.com/NousResearch/hermes-agent/commit/3633c8690) (`apply_yaml_config_fn` registry hook, v0.13.0, 2026-05-13). This release retires the fork-branch dependency and adopts those upstream extension points.
->
-> The two PRs this plugin's earlier releases were carrying forward (`hook/platform-adapter-registry` + `feat/platform-kimi-enum`) have been retired — Teknium's `register_platform()` is the upstream equivalent and is strictly richer than what we were proposing. Historical fork branches are preserved as `archive/*` tags on [`linxule/hermes-agent`](https://github.com/linxule/hermes-agent) for reference.
->
-> Production reference: Bloom (Xule's Pi) has been running this plugin continuously since 2026-04-27 — first against the fork branch, now against vanilla upstream main. Logger module name `hermes_plugins.kimi.kimi_adapter` in gateway logs confirms the plugin path is active end-to-end.
+Current version: **2.1.5**. Targets vanilla upstream `NousResearch/hermes-agent` ≥ 0.13.0 (uses `ctx.register_platform()` and `apply_yaml_config_fn`). See [CHANGELOG.md](CHANGELOG.md) for the full release history.
+
+Production reference: the plugin has been running continuously on a long-lived Raspberry Pi deployment since 2026-04-27, first against a fork branch and now against vanilla upstream `main`. Gateway log lines like `Plugin 'kimi' registered platform: kimi` and `hermes_plugins.kimi.kimi_adapter: Kimi: connected as <bot-name>` confirm the plugin path is active end-to-end.
 
 ## Install
 
@@ -155,7 +139,7 @@ Kimi's wire model wraps **every** conversation behind a `room:<uuid>` prefix, in
 So a valid `KIMI_HOME_CHANNEL` looks like:
 
 ```
-KIMI_HOME_CHANNEL=room:19e31a29-4722-8804-8000-094a7731741b
+KIMI_HOME_CHANNEL=room:<uuid>
 ```
 
 The UUID is owned by kimi.com — get it from your gateway's `inbound message` log line for the target chat (`chat=room:<uuid>`), or rely on `/sethome` to pick it up for you.
@@ -170,7 +154,7 @@ The room UUIDs kimi.com assigns to a 1:1 conversation are **derived from the bot
 - Cron deliveries with `deliver: kimi` look like they succeeded (HTTP 200 from kimi.com) but the recipient sees nothing
 - The first hint is usually a user noticing they stopped seeing gateway-status pings
 
-**Diagnose** by comparing the bot's `id=...` in the `Kimi: connected as ...` log line against the UUID stem in `KIMI_HOME_CHANNEL`. If the first segment differs (e.g. bot reports `id=19e31a29-...` but the home channel says `room:19dbb6a7-...`), the home channel is stale.
+**Diagnose** by comparing the bot's `id=...` in the `Kimi: connected as ...` log line against the UUID stem in `KIMI_HOME_CHANNEL`. If the first segment differs (e.g. bot reports `id=AAAAAAAA-...` but the home channel says `room:BBBBBBBB-...`), the home channel is stale.
 
 **Recover** by either:
 
@@ -222,7 +206,7 @@ platforms:
     extra:
       group_require_mention: true
       kimi_free_response_chats:
-        - room:19e31a29-4722-8804-8000-094a7731741b   # 1:1 DM with the user
+        - room:<dm-uuid>   # 1:1 DM with the user
         # Add additional room UUIDs here if you want certain groups to be
         # free-response regardless of the global mention gate.
 ```
@@ -255,35 +239,21 @@ Modes:
 - **`passthrough`** *(default)* — both paths emit. Agent prose streams to Kimi as it's generated, plus tool-driven and cron sends. Matches every other Hermes platform adapter.
 - **`tool_only`** — path 1 is suppressed. Agent prose stays in Hermes logs but never reaches Kimi. Useful for cron-only or batch deployments where the agent's streaming text isn't wanted at the platform layer.
 
-#### ⚠️ Known limitation: `tool_only` + `send_message_tool`
+#### `tool_only` and `send_message_tool` — known limitation
 
-Against current upstream Hermes (`NousResearch/hermes-agent` ≤ 0.14.0), `send_message_tool._send_via_adapter` prefers the live adapter (`adapter.send()`) when one exists. That means explicit `send_message_tool` calls go through **Path 1** in practice, not Path 2 — so in `tool_only` mode they're silently suppressed alongside the gateway prose.
+Against current upstream Hermes (≤ 0.14.0), `send_message_tool._send_via_adapter` prefers the live `adapter.send()` over `standalone_sender_fn` when both are available (this is upstream's documented dispatch contract — live in-process adapter first, standalone fallback for out-of-process callers). In `tool_only` mode that means explicit tool sends from an in-process gateway are silently suppressed alongside streaming prose, because this adapter currently doesn't differentiate "prose chunk" from "explicit tool send" at the gate.
 
-In practice this affects:
+It's a plugin-side limitation, not an upstream gap. Until the adapter grows differentiation:
 
-- **In-process gateways with `tool_only`**: agent's explicit tool sends to Kimi disappear (the adapter's `send()` returns `SendResult(success=True)` without dispatching). No error, no log warning.
-- **In-process gateways with `passthrough`** *(the default)*: unaffected — tool sends work normally because Path 1 isn't suppressed.
-- **Out-of-process cron with `tool_only`**: cron delivery still works because no live adapter is present, so dispatch falls through to `standalone_sender_fn` (Path 2).
+- For **interactive 1:1 DMs**, stay on `passthrough` (the default). `tool_only` makes the bot indistinguishable from a hung one.
+- For **cron-only or out-of-process deployments**, `tool_only` works because cron dispatch falls through to `standalone_sender_fn` (Path 2), which is not gated by `output_mode`.
+- For **mixed in-process + cron**, the safer choice is `passthrough`.
 
-The right architectural fix is upstream: extending `send_message_tool`'s plugin-extensibility surface so out-of-process / tool-call sends can route via plugin-owned dispatch logic rather than always preferring the live adapter. An upstream issue will track this — link will be added here once filed.
+### Send-timeout policy (v2.1.4+)
 
-Until that lands, two workarounds for `tool_only` deployments that need explicit tool sends:
+Client-side `aiohttp.ClientTimeout` firing on a `SendMessage` POST is treated as **non-retryable** by the live-adapter `send()` and by the standalone `send_kimi_message()` helper. Production instrumentation in v2.1.4 captured a case where kimi.com server-side accepted the POST internally but held the HTTP response on that specific TCP connection past the 30 s timeout — the gateway's retry layer would then re-POST on a fresh connection, and the user would see the message twice.
 
-1. **Run cron out-of-process from the gateway** (separate `hermes cron` runner). Cron deliveries route via `standalone_sender_fn` and bypass the suppressed live-adapter `send()` cleanly.
-2. **Stay on `passthrough`** unless you've verified that your specific deployment shape doesn't depend on `send_message_tool` to Kimi.
-
-When `tool_only` is still the right choice (with the caveat above understood):
-
-- **Group rooms** where streaming prose would be noisy and the agent should emit a single curated reply via `send_message_tool` AND that delivery happens via out-of-process cron OR a future upstream Hermes that prefers `standalone_sender_fn`.
-- **Cron-only deployments** with no interactive turns and no in-process `send_message_tool` usage.
-
-When to stay on `passthrough` *(default)*:
-
-- **1:1 DMs** where the user expects streaming-response UX — silence under `tool_only` looks indistinguishable from a hung bot.
-- **Setups where the agent isn't reliably guided** (system prompt or skill nudge) to call `send_message_tool`. Without that guidance, `tool_only` makes the bot appear mute on every turn.
-- **Any in-process gateway** with mixed `send_message_tool` + cron usage until upstream prefers `standalone_sender_fn`.
-
-This flag exists because the bridge's previous workaround (`HIDE_TOOL_CALLS=1`) hung Hermes over stdio. The adapter's in-process coupling lets the suppression happen at the right layer without that deadlock.
+The trade-off: if a future timeout corresponds to a real non-delivery (server-side never accepted), the user sees nothing. The captured production case showed server-side acceptance, but the diagnostic is one data point and the trade-off favours "no duplicates" over "rare drop". See [`CHANGELOG.md`](CHANGELOG.md) for the v2.1.4 / v2.1.5 entries with the full reasoning + the WARNING-level log line you can grep for if you suspect this fired in your deployment.
 
 ### Bounded room state
 
@@ -388,11 +358,11 @@ CI runs the suite against **vanilla upstream `NousResearch/hermes-agent:main`** 
 The plugin code lives in two files at the repo root:
 
 - `__init__.py` — `register(ctx)` function, the only surface the Hermes plugin loader sees
-- `kimi_adapter.py` — full `KimiAdapter(BasePlatformAdapter)` implementation (3,142 LoC)
+- `kimi_adapter.py` — full `KimiAdapter(BasePlatformAdapter)` implementation
 
 `_compat/registry.py` is a vendored compatibility shim: it tries to import the upstream registry, and re-raises `ImportError` with an actionable message if the hook isn't present. This makes the plugin's requirements explicit at import time.
 
-`tests/test_kimi.py` contains 154 unit tests covering the adapter; the matching plugin-integration tests (registry registration, dispatch, in-tree fallback) live in the in-fork suite at `tests/hermes_cli/test_kimi_plugin_integration.py` and are not duplicated here because they depend on the full Hermes plugin loader runtime.
+`tests/test_kimi.py` contains the adapter unit tests. They cover envelope codec, chat-id routing, dedup, MessageEvent synthesis, slash-command detection, mention-gate exemption, cross-loop session handling, and the send-arm exception policy. Plugin-integration tests (registry registration, dispatch, in-tree fallback) live in the in-fork suite at `tests/hermes_cli/test_kimi_plugin_integration.py` and are not duplicated here because they depend on the full Hermes plugin loader runtime.
 
 ## License
 

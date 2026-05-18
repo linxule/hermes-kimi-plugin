@@ -1008,6 +1008,24 @@ class KimiAdapter(BasePlatformAdapter):
       - ``room:<uuid>`` for group rooms. Inbound thread-like metadata is kept
         on ``SessionSource.thread_id`` when present, but current Kimi
         ``SendMessageRequest`` does not accept an outbound thread field.
+
+    Loop-affinity invariant (load-bearing — see ``_session_for_current_loop``
+    at the http-session helpers):
+        ``self._http_session`` is created in ``connect()`` and is therefore
+        bound to whichever event loop is running at connect time (the
+        gateway's main loop in normal deployment).  Hermes's
+        ``send_message_tool`` bridges back to async from a sync entry point
+        via a worker-thread loop (``model_tools._run_async`` →
+        ``worker_loop.run_until_complete``).  Calling ``self._http_session``
+        from that worker loop trips aiohttp's
+        ``current_task(loop=self._loop)`` guard and raises ``Timeout context
+        manager should be used inside a task``.  Every async helper that
+        touches the session goes through ``_session_for_current_loop()``,
+        which transparently yields an ephemeral session bound to the current
+        loop when the loops don't match.  Future maintainers: do not call
+        ``self._http_session.post(...)`` directly from any code path that
+        might be reached via the tool dispatcher.  Always go through the
+        helper.
     """
 
     MAX_MESSAGE_LENGTH = MAX_MESSAGE_LENGTH
@@ -1366,10 +1384,14 @@ class KimiAdapter(BasePlatformAdapter):
         #      ``output_mode``.
         #
         #   2. ``send_kimi_message()`` ← module-level helper at the bottom of
-        #      this file. Invoked by ``tools/send_message_tool.py::_send_kimi``
-        #      (the agent-facing ``send_message_tool``) and by the cron
-        #      scheduler's Kimi delivery path. Bypasses ``adapter.send()``
-        #      entirely → never gated by ``output_mode``.
+        #      this file.  Registered via ``standalone_sender_fn=_standalone_send``
+        #      in ``register()``.  Invoked by Hermes's cron scheduler for
+        #      out-of-process delivery, and by ``send_message_tool`` as the
+        #      fallback path when no live adapter is in-process (per the
+        #      upstream contract at ``tools/send_message_tool.py::_send_via_adapter``,
+        #      which prefers the live ``adapter.send()`` when one exists).
+        #      Bypasses ``adapter.send()`` entirely → never gated by
+        #      ``output_mode``.
         #
         # Modes:
         #   ``passthrough`` (default) — both paths emit. Agent prose streams
@@ -1762,13 +1784,16 @@ class KimiAdapter(BasePlatformAdapter):
         # ── Lift 3b: output_mode gate ─────────────────────────────────────
         # In ``tool_only`` mode the agent's prose responses are suppressed.
         #
-        # Known limitation against current upstream Hermes (≤ 0.14.0):
+        # Known behaviour against current upstream Hermes (≤ 0.14.0):
         # ``send_message_tool._send_via_adapter`` prefers the live adapter
-        # over ``standalone_sender_fn`` when both exist, so explicit tool
-        # sends ALSO route through this method and are also suppressed in
-        # ``tool_only`` mode.  See README "Known limitation: tool_only +
-        # send_message_tool" for workarounds + the upstream issue tracking
-        # the fix (prefer ``standalone_sender_fn`` over live adapter).
+        # over ``standalone_sender_fn`` when both exist (this is the
+        # documented dispatch contract).  In ``tool_only`` mode, explicit
+        # tool sends therefore route through this method and are suppressed
+        # alongside streaming prose.  The dispatch contract itself is
+        # correct; the limitation is that this plugin doesn't currently
+        # differentiate prose vs explicit tool sends at the gate.  See
+        # README "tool_only and send_message_tool — known limitation" for
+        # the user-facing guidance + when each output_mode is appropriate.
         #
         # Default is ``passthrough`` so production behavior is unchanged.
         if self._output_mode == "tool_only":

@@ -862,9 +862,13 @@ class SendArmExceptionPolicyTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(result.retryable)
 
     async def test_dm_path_timeout_also_non_retryable(self):
-        # Same policy regardless of dispatch arm.  Kimi delivers user-bot 1:1
-        # conversations as room:<uuid>, so the dm: prefix is rarely exercised
-        # in production — but the contract should hold for both arms.
+        # Dispatcher-level coverage: send()'s try/except at kimi_adapter.py:1809
+        # wraps BOTH the _send_dm and _send_group dispatch arms.  This test
+        # exercises the dm:* arm to prove a timeout from either arm collapses
+        # to the same non-retryable SendResult contract — i.e. the v2.1.4 fix
+        # lives at the dispatcher, not inside _send_group.  In production Kimi
+        # delivers user-bot 1:1 conversations as room:<uuid>, so the dm:
+        # prefix is rarely exercised live, but the contract guarantee must hold.
         adapter = KimiAdapter(_cfg())
         adapter._send_dm = AsyncMock(side_effect=asyncio.TimeoutError())
         with self.assertLogs("kimi_adapter", level="WARNING"):
