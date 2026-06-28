@@ -14,7 +14,7 @@ All notable changes to `hermes-kimi-plugin`. Format loosely follows [Keep a Chan
 - The three DM/standalone fixes and the media-contract fix were first applied and reviewed in the bundled KimiClaw plugin (upstream PR [#28704](https://github.com/NousResearch/hermes-agent/pull/28704), rounds R3 / R14); this release brings the standalone external plugin to parity. The `is_reconnect` fix landed in both the bundled copy and here.
 
 ### Tests
-- Suite: 263/263. Added: 4 media-tuple normalization tests (rewriting two prior bare-string cases that masked the bug), `test_3b_4` / `test_3b_5` (DM round-trip closes on `tool_only` / empty-content), 3 standalone-path exception/429 policy tests, and a `connect(is_reconnect=…)` contract test. Also closed an unclosed-`ClientSession` warning in the existing `connect()` TTL-clear test.
+- Suite: 264/264 (+2 subtests). Added: 4 media-tuple normalization tests (rewriting two prior bare-string cases that masked the bug), `test_3b_4` / `test_3b_5` (DM round-trip closes on `tool_only` / empty-content), 4 standalone-path exception/429 policy tests (transient → retryable, auth → non-retryable, rpc/protocol → non-retryable, 429 → retryable), and a `connect(is_reconnect=…)` contract test. Also closed an unclosed-`ClientSession` warning in the existing `connect()` TTL-clear test.
 
 ## [2.2.2] — 2026-05-18
 
