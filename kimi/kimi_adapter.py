@@ -1451,7 +1451,7 @@ class KimiAdapter(BasePlatformAdapter):
             _raw_mode = "passthrough"
         self._output_mode: str = _raw_mode
 
-    async def connect(self) -> bool:
+    async def connect(self, *, is_reconnect: bool = False) -> bool:
         """Open HTTP session, fetch bot identity, spawn channel loops.
 
         Returns ``True`` if at least one enabled channel is viable.
@@ -1828,9 +1828,18 @@ class KimiAdapter(BasePlatformAdapter):
                 "Kimi: output_mode=tool_only — suppressing prose send to %s",
                 chat_id,
             )
+            # Bug fix: still need to close the inflight DM round-trip even when
+            # we suppress the prose send, otherwise Kimi's UI spinner hangs
+            # waiting for end_turn until WS reconnect. See _close_dm_inflight.
+            if chat_id.startswith(_CHATID_DM_PREFIX):
+                await self._close_dm_inflight(chat_id[len(_CHATID_DM_PREFIX):])
             return SendResult(success=True)
 
         if not content:
+            # Same fix as the tool_only path: empty content still needs to
+            # close any pending DM inflight round-trip.
+            if chat_id.startswith(_CHATID_DM_PREFIX):
+                await self._close_dm_inflight(chat_id[len(_CHATID_DM_PREFIX):])
             return SendResult(success=True)
 
         metadata = metadata or {}
@@ -2735,20 +2744,34 @@ class KimiAdapter(BasePlatformAdapter):
             await self._dm_emit_chunk(kimi_sid, chunk)
 
         # Pop the oldest in-flight prompt for this sid (FIFO) and close its
-        # round-trip. If the queue empties, drop the mapping.
-        queue = self._dm_inflight.get(kimi_sid)
-        inflight: Optional[_DMInflight] = None
-        if queue:
-            inflight = queue.popleft()
-            if not queue:
-                self._dm_inflight.pop(kimi_sid, None)
-        if inflight is not None and inflight.req_id is not None:
-            await self._dm_respond(inflight.req_id, {"stopReason": "end_turn"})
+        # round-trip via _close_dm_inflight (shared with send()'s short-
+        # circuit paths so tool_only / empty-content don't hang the spinner).
+        await self._close_dm_inflight(kimi_sid)
 
         return SendResult(
             success=True,
             message_id=f"dm-{uuid.uuid4().hex[:12]}",
         )
+
+    async def _close_dm_inflight(self, kimi_sid: str) -> None:
+        """Pop the oldest in-flight DM prompt and close its JSON-RPC round-trip.
+
+        Called both by ``_send_dm`` (after streaming the prose chunks) and by
+        ``send()``'s short-circuit paths (``output_mode='tool_only'`` and
+        empty-content). Without this in the short-circuits, the Kimi UI
+        spinner hangs waiting for ``end_turn`` until the next WS reconnect
+        clears ``_dm_inflight``.
+
+        Safe to call when no inflight prompt exists (no-op).
+        """
+        queue = self._dm_inflight.get(kimi_sid)
+        if not queue:
+            return
+        inflight = queue.popleft()
+        if not queue:
+            self._dm_inflight.pop(kimi_sid, None)
+        if inflight.req_id is not None:
+            await self._dm_respond(inflight.req_id, {"stopReason": "end_turn"})
 
     # ──────────────────────────────────────────────────────────────────────
     # Group Subscribe loop
@@ -4027,7 +4050,7 @@ async def send_kimi_message(
                     return SendResult(
                         success=False,
                         error=f"HTTP {resp.status}: {raw[:200]!r}",
-                        retryable=(resp.status >= 500),
+                        retryable=(resp.status >= 500 or resp.status == 429),
                     )
                 try:
                     data = json.loads(raw.decode("utf-8")) if raw else {}
@@ -4063,6 +4086,16 @@ async def send_kimi_message(
         )
     except aiohttp.ClientError as exc:
         return SendResult(success=False, error=f"network error: {exc}", retryable=True)
+    except KimiAuthError as exc:
+        # Upload path raised: token revoked / expired. Non-retryable, mirroring
+        # the live send-path exception mapping.
+        return SendResult(success=False, error=str(exc), retryable=False)
+    except KimiTransientError as exc:
+        # Upload path raised: 429 / 5xx from the upload endpoint. Retryable.
+        return SendResult(success=False, error=str(exc), retryable=True)
+    except (KimiRpcError, KimiProtocolError) as exc:
+        # Upload path raised: 4xx from upload, or malformed response. Non-retryable.
+        return SendResult(success=False, error=str(exc), retryable=False)
 
 
 async def _standalone_send(
@@ -4071,17 +4104,23 @@ async def _standalone_send(
     message: str,
     *,
     thread_id: Optional[str] = None,
-    media_files: Optional[List[str]] = None,
+    media_files: Optional[List[Tuple[str, bool]]] = None,
     force_document: bool = False,
 ) -> Dict[str, Any]:
     """Registry wrapper for out-of-process ``send_message_tool`` / cron sends."""
     _ = force_document  # Kimi has no document-vs-native attachment split.
+    # ``send_message_tool`` yields ``(path, is_voice)`` tuples (via
+    # ``BasePlatformAdapter.extract_media``) before invoking ``standalone_sender_fn``.
+    # Normalize to bare paths; Kimi uploads every attachment generically and has
+    # no voice-note concept, so the flag is dropped (mirrors the discord adapter's
+    # ``for media_path, _is_voice in media_files``).
+    media_paths = [media_path for media_path, _is_voice in (media_files or [])]
     result = await send_kimi_message(
         pconfig,
         chat_id,
         message,
         thread_id=thread_id,
-        media_paths=media_files,
+        media_paths=media_paths,
     )
     if result.success:
         payload: Dict[str, Any] = {"success": True}

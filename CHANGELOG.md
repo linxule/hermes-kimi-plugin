@@ -2,6 +2,20 @@
 
 All notable changes to `hermes-kimi-plugin`. Format loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); the project uses semver where API contract changes bump major, behavior changes bump minor, and bug fixes bump patch.
 
+## [2.2.3] — 2026-06-29
+
+### Fixed
+- **`connect()` adopts the `is_reconnect` contract (hermes-agent ≥ 0.17.0).** `BasePlatformAdapter.connect` became `async def connect(self, *, is_reconnect: bool = False)` in 0.17.0 (`gateway/platforms/base.py`); the gateway's reconnect watcher now calls `connect(is_reconnect=True)`. The adapter's old `connect(self)` signature would raise `TypeError` on every reconnect. It now accepts the keyword-only flag and ignores it — the adapter clears its TTL state each connect cycle and holds no durable server-side update queue to preserve, matching the in-tree `yuanbao` / `weixin` adapters. Backward-compatible (default `False`); no `hermes-agent` floor bump required.
+- **Standalone media-contract tuple bug (`_standalone_send`).** `send_message_tool` delivers attachments as `(path, is_voice)` tuples (via `BasePlatformAdapter.extract_media`), but `_standalone_send` forwarded them unchanged toward `Path(...)`, raising `TypeError` — which the host swallows as a generic `"Plugin standalone send failed"`, i.e. a **silent attachment drop** on cron / out-of-process sends to group rooms. Now normalized to bare upload paths, dropping the voice flag (Kimi has no voice-note concept): `media_paths = [p for p, _is_voice in (media_files or [])]`. Previously tracked in `KNOWN-ISSUES.md` (now resolved).
+- **`tool_only` / empty-content DM sends no longer hang the Kimi UI spinner.** `send()`'s `output_mode="tool_only"` and empty-content short-circuits returned without closing the in-flight DM JSON-RPC round-trip, so Kimi's UI spinner hung waiting for `end_turn` until the next WS reconnect (and the inflight deque leaked). Extracted `_close_dm_inflight()` (shared with `_send_dm`) and now call it on both short-circuit paths.
+- **Standalone upload-path exceptions no longer leak.** `send_kimi_message` (the cron / `send_message_tool` path) now maps upload-path `KimiAuthError` → `retryable=False`, `KimiTransientError` → `retryable=True`, and `KimiRpcError` / `KimiProtocolError` → `retryable=False`, instead of letting them propagate uncaught. A `SendMessage` `429` response is now `retryable=True` (was only `>= 500`).
+
+### Context
+- The three DM/standalone fixes and the media-contract fix were first applied and reviewed in the bundled KimiClaw plugin (upstream PR [#28704](https://github.com/NousResearch/hermes-agent/pull/28704), rounds R3 / R14); this release brings the standalone external plugin to parity. The `is_reconnect` fix landed in both the bundled copy and here.
+
+### Tests
+- Suite: 263/263. Added: 4 media-tuple normalization tests (rewriting two prior bare-string cases that masked the bug), `test_3b_4` / `test_3b_5` (DM round-trip closes on `tool_only` / empty-content), 3 standalone-path exception/429 policy tests, and a `connect(is_reconnect=…)` contract test. Also closed an unclosed-`ClientSession` warning in the existing `connect()` TTL-clear test.
+
 ## [2.2.2] — 2026-05-18
 
 ### Docs

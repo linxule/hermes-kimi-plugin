@@ -460,6 +460,16 @@ Vanilla upstream Hermes does NOT apply `${VAR}` substitution to values inside `p
 
 This plugin uses approach (1) for forward-compat safety. See `kimi/kimi_adapter.py` if you want the helper as prior art.
 
+### Standalone `media_files` arrives as `(path, is_voice)` tuples (v2.2.3)
+
+If you register a `standalone_sender_fn` (the out-of-process / cron send path), the media argument is **not** a list of path strings. Upstream's `send_message_tool` runs the attachments through `BasePlatformAdapter.extract_media` (newer upstream: `filter_media_delivery_paths`) first, so your function receives a `List[Tuple[str, bool]]` of `(path, is_voice)` tuples. Forwarding that straight to `Path(...)` / `mimetypes.guess_type(...)` raises `TypeError`, which the host swallows as a generic `"Plugin standalone send failed"` — a **silent attachment drop**, not a crash. Normalize first:
+
+```python
+media_paths = [media_path for media_path, _is_voice in (media_files or [])]
+```
+
+Drop the `is_voice` flag unless your platform has a distinct voice-note upload (mirrors the in-tree discord adapter's `for media_path, _is_voice in media_files`). This bit this plugin in v2.2.2 and was fixed in v2.2.3.
+
 ## License
 
 MIT — see [LICENSE](LICENSE).

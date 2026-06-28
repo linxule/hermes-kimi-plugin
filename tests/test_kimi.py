@@ -295,7 +295,13 @@ class StandaloneSendTokenResolutionTests(unittest.TestCase):
 
 
 class StandaloneSendRegistryWrapperTests(unittest.TestCase):
-    """The registered standalone_sender_fn wrapper matches upstream's contract."""
+    """The registered standalone_sender_fn wrapper matches upstream's contract.
+
+    ``send_message_tool`` yields ``(path, is_voice)`` tuples (via
+    ``BasePlatformAdapter.extract_media``) before invoking the wrapper, so
+    ``media_files`` arrives as ``(path, is_voice)`` tuples; these tests assert
+    that shape is normalized to bare upload paths.
+    """
 
     def test_success_result_converts_to_send_message_tool_dict(self):
         cfg = PlatformConfig(enabled=True, token="tok", extra={})
@@ -309,7 +315,9 @@ class StandaloneSendRegistryWrapperTests(unittest.TestCase):
                     "room:abc",
                     "hello",
                     thread_id="thread-1",
-                    media_files=["/tmp/a.png"],
+                    # Real registry contract: extract_media() yields
+                    # (path, is_voice) tuples before standalone_sender_fn.
+                    media_files=[("/tmp/a.png", False)],
                 )
             )
 
@@ -349,7 +357,7 @@ class StandaloneSendRegistryWrapperTests(unittest.TestCase):
                     cfg,
                     "room:abc",
                     "hello",
-                    media_files=["/tmp/a.pdf"],
+                    media_files=[("/tmp/a.pdf", False)],
                     force_document=True,
                 )
             )
@@ -361,6 +369,59 @@ class StandaloneSendRegistryWrapperTests(unittest.TestCase):
             "hello",
             thread_id=None,
             media_paths=["/tmp/a.pdf"],
+        )
+
+    def test_media_files_empty_list_forwards_empty(self):
+        cfg = PlatformConfig(enabled=True, token="tok", extra={})
+        with patch(
+            "kimi_adapter.send_kimi_message",
+            new=AsyncMock(return_value=SendResult(success=True)),
+        ) as mock_send:
+            asyncio.run(_standalone_send(cfg, "room:abc", "hi", media_files=[]))
+        self.assertEqual(mock_send.await_args.kwargs["media_paths"], [])
+
+    def test_media_files_none_default_forwards_empty(self):
+        cfg = PlatformConfig(enabled=True, token="tok", extra={})
+        with patch(
+            "kimi_adapter.send_kimi_message",
+            new=AsyncMock(return_value=SendResult(success=True)),
+        ) as mock_send:
+            asyncio.run(_standalone_send(cfg, "room:abc", "hi"))
+        self.assertEqual(mock_send.await_args.kwargs["media_paths"], [])
+
+    def test_media_files_voice_tuple_keeps_path_drops_flag(self):
+        # A (path, True) voice tuple: Kimi uploads the file like any other
+        # attachment and discards the voice flag (no voice-note wire concept).
+        cfg = PlatformConfig(enabled=True, token="tok", extra={})
+        with patch(
+            "kimi_adapter.send_kimi_message",
+            new=AsyncMock(return_value=SendResult(success=True)),
+        ) as mock_send:
+            asyncio.run(
+                _standalone_send(
+                    cfg, "room:abc", "voice", media_files=[("/tmp/v.ogg", True)]
+                )
+            )
+        self.assertEqual(mock_send.await_args.kwargs["media_paths"], ["/tmp/v.ogg"])
+
+    def test_media_files_mixed_tuples_normalize_to_paths(self):
+        # Multiple attachments, mixed voice flags -> ordered list of bare paths.
+        cfg = PlatformConfig(enabled=True, token="tok", extra={})
+        with patch(
+            "kimi_adapter.send_kimi_message",
+            new=AsyncMock(return_value=SendResult(success=True)),
+        ) as mock_send:
+            asyncio.run(
+                _standalone_send(
+                    cfg,
+                    "room:abc",
+                    "both",
+                    media_files=[("/tmp/a.png", False), ("/tmp/v.ogg", True)],
+                )
+            )
+        self.assertEqual(
+            mock_send.await_args.kwargs["media_paths"],
+            ["/tmp/a.png", "/tmp/v.ogg"],
         )
 
 
@@ -465,6 +526,121 @@ class SendKimiMessageStandalonePolicyTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(result.success)
         self.assertTrue(result.retryable)
         self.assertIn("network error", result.error)
+
+    async def test_standalone_upload_transient_error_is_retryable(self):
+        # v2.2.3: a KimiTransientError from the upload path (429/5xx on file
+        # upload) must be caught and returned retryable=True, not leaked
+        # uncaught through send_kimi_message.
+        from kimi_adapter import KimiTransientError
+        cfg = PlatformConfig(
+            enabled=True,
+            token="km_b_prod_UPLOAD_TRANSIENT_TEST",
+            extra={"enable_groups": True},
+        )
+        with patch(
+            "kimi_adapter._upload_kimi_files",
+            new=AsyncMock(side_effect=KimiTransientError("upload 503")),
+        ):
+            result = await send_kimi_message(
+                cfg,
+                chat_id="room:upload-transient",
+                text="see attachment",
+                media_paths=["/tmp/a.png"],
+            )
+        self.assertFalse(result.success)
+        self.assertTrue(result.retryable)
+
+    async def test_standalone_upload_auth_error_is_non_retryable(self):
+        # v2.2.3: a KimiAuthError from the upload path (revoked/expired token)
+        # must be caught and returned retryable=False — re-POSTing a 401 is
+        # pointless until reconnect re-evaluates auth.
+        from kimi_adapter import KimiAuthError
+        cfg = PlatformConfig(
+            enabled=True,
+            token="km_b_prod_UPLOAD_AUTH_TEST",
+            extra={"enable_groups": True},
+        )
+        with patch(
+            "kimi_adapter._upload_kimi_files",
+            new=AsyncMock(side_effect=KimiAuthError("401 revoked")),
+        ):
+            result = await send_kimi_message(
+                cfg,
+                chat_id="room:upload-auth",
+                text="see attachment",
+                media_paths=["/tmp/a.png"],
+            )
+        self.assertFalse(result.success)
+        self.assertFalse(result.retryable)
+
+    async def test_standalone_upload_rpc_protocol_errors_are_non_retryable(self):
+        # v2.2.3: a KimiRpcError / KimiProtocolError from the upload path (a 4xx
+        # upload rejection or a malformed upload response) must be caught and
+        # returned retryable=False, not leaked uncaught through send_kimi_message.
+        from kimi_adapter import KimiProtocolError, KimiRpcError
+        cfg = PlatformConfig(
+            enabled=True,
+            token="km_b_prod_UPLOAD_RPC_TEST",
+            extra={"enable_groups": True},
+        )
+        for exc_type in (KimiRpcError, KimiProtocolError):
+            with self.subTest(exc=exc_type.__name__):
+                with patch(
+                    "kimi_adapter._upload_kimi_files",
+                    new=AsyncMock(side_effect=exc_type("upload 4xx / bad response")),
+                ):
+                    result = await send_kimi_message(
+                        cfg,
+                        chat_id="room:upload-rpc",
+                        text="see attachment",
+                        media_paths=["/tmp/a.png"],
+                    )
+                self.assertFalse(result.success)
+                self.assertFalse(result.retryable)
+
+    async def test_standalone_send_429_is_retryable(self):
+        # v2.2.3: a 429 from the SendMessage POST must be retryable (was only
+        # >= 500 before). Mirrors the live-arm transient policy.
+        cfg = PlatformConfig(
+            enabled=True,
+            token="km_b_prod_SEND_429_TEST",
+            extra={"enable_groups": True},
+        )
+
+        class _Resp429:
+            status = 429
+
+            async def read(self_inner):
+                return b"rate limited"
+
+            async def __aenter__(self_inner):
+                return self_inner
+
+            async def __aexit__(self_inner, *exc):
+                return False
+
+        fake_session = MagicMock()
+        fake_session.post = MagicMock(return_value=_Resp429())
+
+        class _FakeSessionFactory:
+            async def __aenter__(self_inner):
+                return fake_session
+
+            async def __aexit__(self_inner, *exc):
+                return False
+
+        with patch(
+            "kimi_adapter.aiohttp.ClientSession",
+            return_value=_FakeSessionFactory(),
+        ):
+            result = await send_kimi_message(
+                cfg,
+                chat_id="room:send-429",
+                text="hello",
+            )
+        self.assertFalse(result.success)
+        self.assertTrue(result.retryable)
+        self.assertIn("429", result.error)
 
 
 class CrossLoopSessionTests(unittest.TestCase):
@@ -5020,10 +5196,39 @@ class PendingEnqueuedAtCleanupTests(unittest.IsolatedAsyncioTestCase):
             # Returns False because GetMe raises; the clear() ran before that.
             result = await adapter.connect()
             self.assertFalse(result, "connect() should fail when GetMe raises")
+        # _cleanup_http was mocked out above so the aiohttp.ClientSession that
+        # connect() opened at session start never gets closed by the SUT.
+        # Close it here to keep the suite warning-clean.
+        if adapter._http_session is not None and not adapter._http_session.closed:
+            await adapter._http_session.close()
         self.assertEqual(
             adapter._pending_enqueued_at, {},
             "connect should clear stale TTL state at session start"
         )
+
+    async def test_connect_accepts_is_reconnect_kwarg(self):
+        """connect() must honour the BasePlatformAdapter contract
+        (hermes-agent >= 0.17.0), which the gateway calls as
+        ``connect(is_reconnect=...)`` from the reconnect watcher. The kwarg
+        is keyword-only with a default, so the cold-boot call site is
+        unaffected; the adapter holds no durable server-side queue to
+        preserve, so it accepts and ignores the flag — mirroring the in-tree
+        yuanbao/weixin adapters. Pins the signature so a future edit can't
+        silently drop it: cold-boot tests call connect() with no args, so
+        only this test exercises the reconnect call site."""
+        adapter = KimiAdapter(_cfg())
+        from kimi_adapter import KimiAuthError
+        with patch.object(adapter, "_acquire_platform_lock", return_value=True), \
+             patch.object(adapter, "_rpc_unary", new=AsyncMock(side_effect=KimiAuthError("test"))), \
+             patch.object(adapter, "_cleanup_http", new=AsyncMock()), \
+             patch.object(adapter, "_release_platform_lock"):
+            # Behaviour is identical to cold boot (flag ignored): short-circuits
+            # False at GetMe. The point is that the keyword is accepted at the
+            # real call site without a TypeError.
+            result = await adapter.connect(is_reconnect=True)
+            self.assertFalse(result, "connect(is_reconnect=True) must be accepted")
+        if adapter._http_session is not None and not adapter._http_session.closed:
+            await adapter._http_session.close()
 
     async def test_handle_message_cleanup_runs_on_cancellation(self):
         """try/finally ensures the post-super cleanup runs on CancelledError,
@@ -5336,6 +5541,50 @@ class HakimiLift3bOutputModeTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(result_group.success)
         adapter._send_dm.assert_not_awaited()
         adapter._send_group.assert_not_awaited()
+
+    async def test_3b_4_tool_only_mode_still_closes_inflight_dm(self):
+        """3b.4 — tool_only DM suppression still pops inflight + responds end_turn.
+
+        Regression: without _close_dm_inflight in send()'s short-circuit, the
+        DM JSON-RPC reply never fires and Kimi's UI spinner hangs until WS
+        reconnect. The inflight deque also grows unbounded over WS lifetime.
+        """
+        adapter = KimiAdapter(_cfg(output_mode="tool_only"))
+        adapter._dm_respond = AsyncMock()
+        adapter._send_dm = AsyncMock(return_value=SendResult(success=True))
+
+        # Simulate an in-flight prompt as _dm_handle_prompt would.
+        sid = "user-xyz"
+        adapter._dm_inflight.setdefault(sid, deque()).append(
+            _DMInflight(kimi_sid=sid, req_id=42)
+        )
+
+        result = await adapter.send(
+            chat_id=f"dm:{sid}", content="agent prose to suppress"
+        )
+
+        # tool_only still short-circuits the prose
+        self.assertTrue(result.success)
+        adapter._send_dm.assert_not_awaited()
+        # …but the JSON-RPC end_turn reply fires so the UI spinner closes
+        adapter._dm_respond.assert_awaited_once_with(42, {"stopReason": "end_turn"})
+        # …and the inflight queue is fully drained (no leak)
+        self.assertNotIn(sid, adapter._dm_inflight)
+
+    async def test_3b_5_empty_content_still_closes_inflight_dm(self):
+        """3b.5 — empty content send() short-circuit also closes inflight DM."""
+        adapter = KimiAdapter(_cfg(output_mode="passthrough"))
+        adapter._dm_respond = AsyncMock()
+
+        sid = "user-empty"
+        adapter._dm_inflight.setdefault(sid, deque()).append(
+            _DMInflight(kimi_sid=sid, req_id=99)
+        )
+
+        result = await adapter.send(chat_id=f"dm:{sid}", content="")
+        self.assertTrue(result.success)
+        adapter._dm_respond.assert_awaited_once_with(99, {"stopReason": "end_turn"})
+        self.assertNotIn(sid, adapter._dm_inflight)
 
 
 class HakimiLift3bOutputModeInitTests(unittest.TestCase):
